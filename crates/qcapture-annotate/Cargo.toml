@@ -1,0 +1,15 @@
+[package]
+name = "qcapture-annotate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+# Text rasterization (pure Rust) + watermark decode. Both already in the
+# workspace lockfile; no native system deps.
+ab_glyph = "0.2"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

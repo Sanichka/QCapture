@@ -1,0 +1,31 @@
+[package]
+name = "qcapture-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+qcapture-core = { path = "../qcapture-core" }
+qcapture-capture = { path = "../qcapture-capture" }
+qcapture-audio = { path = "../qcapture-audio" }
+qcapture-encode = { path = "../qcapture-encode" }
+qcapture-annotate = { path = "../qcapture-annotate" }
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+# Phase 4c-take-2 live drawing: eframe DrawPanel with a live video texture
+# (no transparent overlay anywhere — the winit layered color-key window
+# proved unhittable on Win10 and was retired).
+flume = "0.11"
+# Phase 2a: fullscreen region picker overlay (transparent borderless window).
+# wgpu renderer (DirectX 12 on Windows): required for per-pixel alpha so the
+# desktop shows through the dim layer. The glow/OpenGL path falls back to an
+# opaque surface when the driver offers no transparent WGL config (black screen).
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "wgpu"] }
+# eframe enables wgpu with default-features=false (no backends); add DX12 + WGSL
+# here (additive across the graph). Vulkan/metal backends land with Phase 6 ports.
+# (Default wgpu backends would probe this machine's broken third-party Vulkan
+# layers first — harmless but noisy — so we pin to DX12 only.)
+wgpu = { version = "25", default-features = false, features = ["dx12", "wgsl"] }

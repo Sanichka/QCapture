@@ -1,0 +1,28 @@
+[workspace]
+members = [
+  "crates/qcapture-core",
+  "crates/qcapture-capture",
+  "crates/qcapture-audio",
+  "crates/qcapture-encode",
+  "crates/qcapture-annotate",
+  "crates/qcapture-ui",
+  "crates/qcapture-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.78"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+# Small binary profile for UI-only helpers: cargo build --profile dist-small
+[profile.dist-small]
+inherits = "release"
+opt-level = "z"

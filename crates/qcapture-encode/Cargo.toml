@@ -1,0 +1,15 @@
+[package]
+name = "qcapture-encode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+qcapture-core = { path = "../qcapture-core" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+flume = "0.11"
+# Windows named-pipe audio input for ffmpeg (no second stdin exists).
+[target.'cfg(windows)'.dependencies]
+interprocess = "2"

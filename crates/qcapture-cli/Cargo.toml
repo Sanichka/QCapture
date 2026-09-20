@@ -1,0 +1,25 @@
+[package]
+name = "qcapture-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "qcapture"
+path = "src/main.rs"
+
+[dependencies]
+qcapture-core = { path = "../qcapture-core" }
+qcapture-capture = { path = "../qcapture-capture" }
+qcapture-audio = { path = "../qcapture-audio" }
+qcapture-encode = { path = "../qcapture-encode" }
+qcapture-annotate = { path = "../qcapture-annotate" }
+qcapture-ui = { path = "../qcapture-ui" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1"
+ctrlc = "3"
+chrono = "0.4"
+flume = "0.11"

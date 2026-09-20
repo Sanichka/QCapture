@@ -1,0 +1,17 @@
+[package]
+name = "qcapture-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+qcapture-core = { path = "../qcapture-core" }
+cpal = "0.18"
+flume = "0.11"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+
+# WASAPI loopback (system audio) is Windows-only; PipeWire/SCKit land Phase 6.
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.24"

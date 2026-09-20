@@ -1,0 +1,24 @@
+[package]
+name = "qcapture-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+qcapture-core = { path = "../qcapture-core" }
+qcapture-encode = { path = "../qcapture-encode" }
+qcapture-annotate = { path = "../qcapture-annotate" }
+display-info = "0.5"
+xcap = "0.4"
+flume = "0.11"
+thiserror = "2"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+
+# Windows-first native capture (WGC) + HW MediaFoundation encoder.
+# Windows-only so Linux/macOS builds stay clean; cross-platform SCKit/PipeWire lands Phase 6.
+[target.'cfg(windows)'.dependencies]
+windows-capture = "2"
+# Cursor fx sampling: GetCursorPos/GetWindowRect per kept frame + button
+# edge polling (no global hook). Only linked into the Windows build.
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }

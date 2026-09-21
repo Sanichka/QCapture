@@ -65,6 +65,7 @@ impl Pacer {
 /// Shared tail: spawn the pump, run `bridge` on the calling thread, then
 /// shut audio down BEFORE joining the pump (ffmpeg only exits once all
 /// inputs hit EOF — reversed order deadlocks; same contract as WGC).
+#[allow(clippy::too_many_arguments)]
 fn run_with_bridge(
     feed_w: u32,
     feed_h: u32,
@@ -196,6 +197,7 @@ pub fn run_xcap_monitor(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_xcap_region(
     display: &DisplayInfo,
     x: u32,

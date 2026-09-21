@@ -213,8 +213,8 @@ pub(crate) fn spawn_packet_thread(
 
 /// Spawn a detached packet thread for an already-resolved device at a
 /// pre-picked rate. Returns receiver, stop flag, drop counter and the rate
-/// the mixer should resample from. Loopback path only (non-Windows).
-#[cfg(not(windows))]
+/// the mixer should resample from. Linux loopback path only (the sole user).
+#[cfg(target_os = "linux")]
 pub(crate) fn spawn_packet_thread_for(
     device: cpal::Device,
     rate: u32,
@@ -240,7 +240,7 @@ pub(crate) fn spawn_packet_thread_for(
 }
 
 /// Packet-thread main for a device with an explicit rate (loopback path).
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 fn packet_thread_main_for(
     device: cpal::Device,
     rate: u32,

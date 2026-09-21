@@ -1211,7 +1211,7 @@ fn record_thread_ffmpeg(
         stats.written,
         el.as_secs_f64(),
         size as f64 / 1_000_000.0,
-        fc::encoder_name(kind),
+        pc::encoder_name(kind),
         audio_note
     ))
 }

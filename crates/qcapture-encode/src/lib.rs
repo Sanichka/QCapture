@@ -1,8 +1,7 @@
 //! qcapture-encode: encoder config + ffmpeg CLI orchestration.
-//! Video enters via rawvideo stdin; audio (Phase 5b) via a Windows named pipe
-//! (`audio_pipe`), since a process has only one stdin.
+//! Video enters via rawvideo stdin; audio via an OS pipe (`audio_pipe`:
+//! Windows named pipe, Unix socket), since a process has only one stdin.
 
-#[cfg(windows)]
 pub mod audio_pipe;
 
 use qcapture_core::{CanvasConfig, Container, EncodeConfig, EncoderKind, RateControl};

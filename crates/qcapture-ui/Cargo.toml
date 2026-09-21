@@ -15,6 +15,8 @@ tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
+# Native folder picker for the output-folder button (Windows dialog, no GTK).
+rfd = "0.15"
 # Phase 4c-take-2 live drawing: eframe DrawPanel with a live video texture
 # (no transparent overlay anywhere — the winit layered color-key window
 # proved unhittable on Win10 and was retired).
@@ -23,9 +25,20 @@ flume = "0.11"
 # wgpu renderer (DirectX 12 on Windows): required for per-pixel alpha so the
 # desktop shows through the dim layer. The glow/OpenGL path falls back to an
 # opaque surface when the driver offers no transparent WGL config (black screen).
-eframe = { version = "0.32", default-features = false, features = ["default_fonts", "wgpu"] }
-# eframe enables wgpu with default-features=false (no backends); add DX12 + WGSL
-# here (additive across the graph). Vulkan/metal backends land with Phase 6 ports.
+# eframe with default-features=false (no backends); windowing transports and
+# the native GPU backend are added per OS below (additive across the graph).
 # (Default wgpu backends would probe this machine's broken third-party Vulkan
-# layers first — harmless but noisy — so we pin to DX12 only.)
+# layers first — harmless but noisy — so Windows pins to DX12 only.)
+[target.'cfg(windows)'.dependencies]
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "wgpu"] }
 wgpu = { version = "25", default-features = false, features = ["dx12", "wgsl"] }
+[target.'cfg(target_os = "macos")'.dependencies]
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "wgpu"] }
+wgpu = { version = "25", default-features = false, features = ["metal", "wgsl"] }
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+wgpu = { version = "25", default-features = false, features = ["vulkan", "wgsl"] }
+
+[dev-dependencies]
+# Headless UI tests: drives the real widget (clicks, drags, combos).
+egui_kittest = { version = "0.32", features = ["eframe"] }

@@ -78,6 +78,35 @@ pub fn resolve_auto_encoder(info: &FfmpegInfo) -> EncoderKind {
     }
 }
 
+/// Best available H.264 kind from a probe (probe order matches
+/// [`resolve_auto_encoder` minus the non-H.264 entries).
+pub fn best_h264(info: &FfmpegInfo) -> Option<EncoderKind> {
+    if info.has_nvenc {
+        Some(EncoderKind::H264Nvenc)
+    } else if info.has_amf {
+        Some(EncoderKind::H264Amf)
+    } else if info.has_qsv {
+        Some(EncoderKind::H264Qsv)
+    } else if info.has_videotoolbox {
+        Some(EncoderKind::H264VideoToolbox)
+    } else if info.has_libx264 {
+        Some(EncoderKind::LibX264)
+    } else {
+        None
+    }
+}
+
+/// Best available HEVC kind from a probe (NVENC, then QSV).
+pub fn best_hevc(info: &FfmpegInfo) -> Option<EncoderKind> {
+    if info.has_nvenc {
+        Some(EncoderKind::HevcNvenc)
+    } else if info.has_qsv {
+        Some(EncoderKind::HevcQsv)
+    } else {
+        None
+    }
+}
+
 /// Does this ffmpeg build provide `kind`? Used to fail fast with a clear
 /// message instead of a cryptic ffmpeg stderr dump.
 pub fn supports(kind: EncoderKind, info: &FfmpegInfo) -> bool {

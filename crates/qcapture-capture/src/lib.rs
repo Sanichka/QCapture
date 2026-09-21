@@ -276,6 +276,10 @@ impl Capturer for DummyCapturer {
 // Linux (PipeWire) + macOS (SCKit) record paths land Phase 6.
 // ---------------------------------------------------------------------------
 
+/// Shared encode pump (compositor + ffmpeg feed). Backend-agnostic: the
+/// Windows WGC pusher and the portable xcap bridge both feed it.
+pub mod pump;
+
 #[cfg(windows)]
 pub mod win_record;
 
@@ -284,6 +288,11 @@ pub use win_record::record_monitor as record_monitor_win;
 
 #[cfg(windows)]
 pub mod ffmpeg_cap;
+
+/// Portable capture via xcap (Linux/macOS): screenshot polling on Linux,
+/// AVFoundation on macOS, bridged into the shared pump.
+#[cfg(not(windows))]
+pub mod xcap_cap;
 
 #[cfg(test)]
 mod tests {

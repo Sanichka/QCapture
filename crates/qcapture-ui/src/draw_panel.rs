@@ -142,7 +142,7 @@ impl DrawPanel {
     pub fn push_preview(
         &mut self,
         ctx: &egui::Context,
-        frame: &qcapture_capture::ffmpeg_cap::PreviewFrame,
+        frame: &qcapture_capture::pump::PreviewFrame,
     ) {
         if frame.w < 16 || frame.h < 16 {
             return;
@@ -182,7 +182,7 @@ impl DrawPanel {
     pub fn drain_previews(
         &mut self,
         ctx: &egui::Context,
-        rx: &flume::Receiver<qcapture_capture::ffmpeg_cap::PreviewFrame>,
+        rx: &flume::Receiver<qcapture_capture::pump::PreviewFrame>,
     ) -> usize {
         let mut n = 0;
         // Bounded channel, UI thread only: try_recv loop never blocks.
@@ -502,7 +502,7 @@ pub struct DrawWindowResult {
 
 struct DrawWindowApp {
     panel: DrawPanel,
-    preview_rx: flume::Receiver<qcapture_capture::ffmpeg_cap::PreviewFrame>,
+    preview_rx: flume::Receiver<qcapture_capture::pump::PreviewFrame>,
     /// Set by the capture thread when encoding ends (duration/Ctrl-C/error).
     /// The window auto-closes so `run_draw_window` returns to join/report.
     done_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -542,7 +542,7 @@ pub fn run_draw_window(
     feed_w: u32,
     feed_h: u32,
     events_tx: flume::Sender<DrawEvent>,
-    preview_rx: flume::Receiver<qcapture_capture::ffmpeg_cap::PreviewFrame>,
+    preview_rx: flume::Receiver<qcapture_capture::pump::PreviewFrame>,
     done_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<DrawWindowResult, String> {
     let out: std::sync::Arc<std::sync::Mutex<Option<DrawWindowResult>>> =

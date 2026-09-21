@@ -6,7 +6,7 @@
 pub mod annotate_editor;
 pub mod draw_panel;
 pub mod pick_region;
-#[cfg(windows)]
+pub mod settings;
 pub mod widget;
 
 use qcapture_core::{CanvasConfig, CaptureTarget};

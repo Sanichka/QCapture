@@ -2,8 +2,23 @@
 
 QCapture is a lightweight, cross-platform screen recorder written in Rust.
 Goal: OBS-grade power (hardware encoding, mixed audio, annotations) with the
-speed and simplicity of tools like VokoScreenNG — Windows-first MVP, with
-Linux (PipeWire) and macOS (ScreenCaptureKit) ports planned.
+speed and simplicity of tools like VokoScreenNG — on Windows, Linux, and macOS.
+
+## Platform support
+
+| | Windows | Linux | macOS |
+|---|---|---|---|
+| Monitor / region / window capture | WGC (GPU) | xcap bridge (AVFoundation-grade on mac; screenshot polling on Linux) | xcap bridge |
+| Encoders | MF H.264/HEVC, NVENC/AMF/QSV/x264 | NVENC/QSV/x264 (whatever ffmpeg has) | VideoToolbox/x264 |
+| System audio | WASAPI loopback | PipeWire/ALSA monitor source (best-effort) | mic-only (no OS loopback API) |
+| Mic | yes | yes | yes |
+| Annotations, live draw, widget | yes | yes | yes |
+| Cursor fx | yes | no (no portable cursor position API yet) | no |
+
+Linux/macOS share one portable capture backend feeding the same compositor
+and ffmpeg pipeline, so recordings behave identically across OSes. CI runs
+fmt + clippy + tests on all three; hardware encoding still needs a real GPU
+and a human smoke test per machine.
 
 ## Features
 
@@ -16,8 +31,9 @@ Linux (PipeWire) and macOS (ScreenCaptureKit) ports planned.
     AAC audio through a Windows named pipe.
 - **Rate control** — CBR, VBR (with maxrate ceiling), CQP, CRF (x264).
   MF path is CBR-only; other modes need an ffmpeg encoder.
-- **Audio** — WASAPI system loopback + optional mic, mixed into one AAC track
-  (48 kHz stereo) with per-source gain/mute and a live VU meter. Fail-soft:
+- **Audio** — system loopback + optional mic, mixed into one AAC track
+  (48 kHz stereo) with per-source gain/mute and a live VU meter. WASAPI on
+  Windows, cpal monitor source on Linux, mic-only on macOS. Fail-soft:
   a broken audio device never loses the video.
 - **Annotations (hybrid)** — vector strokes (pen, line, arrow, rect, ellipse,
   text, image) authored in normalized coords, burned into the video *and*
@@ -26,7 +42,8 @@ Linux (PipeWire) and macOS (ScreenCaptureKit) ports planned.
 - **Live drawing** — eframe draw panel with a live video texture showing
   exactly what the encoder sees (no transparent overlay). Works for
   screen, region, and window targets; strokes burn in in real time.
-- **Cursor fx** — opt-in highlight ring + click ripple burned into the video.
+- **Cursor fx** — opt-in highlight ring + click ripple burned into the video
+  (Windows-only for now).
 - **Fixed canvas** — the encoder initializes once; resizes and window-size
   drift are center-cropped/padded mid-record instead of re-initing or freezing.
 - **Floating widget** (`widget`) — target picker, Start/Stop, live audio
@@ -35,10 +52,10 @@ Linux (PipeWire) and macOS (ScreenCaptureKit) ports planned.
 
 ## Requirements
 
-- Windows 10+ (Linux/macOS land in Phase 6).
+- Windows 10+, a modern Linux desktop (X11 or Wayland), or macOS.
 - Rust 1.78+ (`cargo build --release -p qcapture-cli`).
-- `ffmpeg` on PATH with a hardware encoder for the ffmpeg path
-  (`qcapture --probe-ffmpeg` shows what your build provides).
+- `ffmpeg` on PATH (`qcapture --probe-ffmpeg` shows what your build provides;
+  bare `--encoder h264`/`hevc` resolve to the best available family member).
 - Release binary stays under ~11 MB.
 
 ## Quickstart
@@ -91,17 +108,18 @@ Query flags: `--list-screens`, `--list-windows`, `--list-audio`,
 
 ## Architecture
 
-UI thread / capture thread (WGC) / audio thread (WASAPI loopback + mic) /
+UI thread / capture thread (WGC on Windows, xcap bridge elsewhere) /
+audio thread (WASAPI loopback + mic on Windows, cpal monitor/mic elsewhere) /
 compositor+encode pump / mux. Frames travel by handle with `flume` channels;
 the pump blends annotations + cursor fx onto BGRA bytes, feeds ffmpeg stdin
-(video) and a named pipe (mixed PCM audio).
+(video) and an OS pipe — Windows named pipe, Unix socket — with mixed PCM.
 
 | Crate | Role |
 |---|---|
 | `qcapture-core` | Shared types: targets, canvas, encoders, rate control, cursor fx |
-| `qcapture-capture` | Enumeration + WGC capture + ffmpeg byte-frame orchestration |
-| `qcapture-audio` | WASAPI loopback + mic pipeline and mixer |
-| `qcapture-encode` | ffmpeg CLI orchestration, rate maps, audio named pipe |
+| `qcapture-capture` | Enumeration + WGC capture + portable xcap bridge + shared pump |
+| `qcapture-audio` | WASAPI loopback + portable cpal mixer (DSP shared) |
+| `qcapture-encode` | ffmpeg CLI orchestration, rate maps, audio OS pipe |
 | `qcapture-annotate` | Annotation doc + CPU rasterizer |
 | `qcapture-ui` | Region picker, annotate editor, draw panel, widget |
 | `qcapture-cli` | `qcapture` binary |

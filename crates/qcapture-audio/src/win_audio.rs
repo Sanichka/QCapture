@@ -7,19 +7,19 @@
 //! so the encoder's monotonic audio clock never stalls and A/V stay in sync.
 //! Silence (idle desktop, muted sources) is real zeros, not gaps.
 
-use super::{AudioError, MixerLevels};
+use super::cpal_in::{self, MicPacket};
+use super::dsp::{
+    pull_resampled, push_channels_as_stereo, truncate_fifo, MAX_FIFO_FRAMES, OUT_RATE,
+    QUANTUM_BYTES, QUANTUM_FRAMES,
+};
+use super::{AudioError, AudioStats, SharedLevels};
 use std::collections::VecDeque;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
-
-pub const OUT_RATE: u32 = 48_000;
-pub const QUANTUM_FRAMES: usize = 480; // 10 ms @ 48 kHz
-const QUANTUM_BYTES: usize = QUANTUM_FRAMES * 2 * 2; // stereo i16
-const MAX_FIFO_FRAMES: usize = OUT_RATE as usize * 2; // 2 s backlog cap
 
 /// What to capture. Levels are shared (`Arc`) so a UI can move sliders
 /// mid-recording; the mixer snapshots them once per 10 ms quantum.
@@ -28,97 +28,6 @@ pub struct WinAudioConfig {
     pub capture_system: bool,
     pub mic_query: Option<String>,
     pub levels: std::sync::Arc<SharedLevels>,
-}
-
-/// Live gain/mute state shared between UI and mixer thread.
-/// Gains stored as f32 bit patterns for lock-free atomic access.
-#[derive(Debug, Default)]
-pub struct SharedLevels {
-    sys_gain_bits: AtomicU32,
-    mic_gain_bits: AtomicU32,
-    sys_mute: AtomicBool,
-    mic_mute: AtomicBool,
-    /// Mixed-output peak (0.0..1.0 bits), updated per quantum with max().
-    /// UI drains via [`SharedLevels::take_peak`] and applies its own decay.
-    peak_bits: AtomicU32,
-}
-
-impl SharedLevels {
-    pub fn new(levels: MixerLevels) -> Arc<Self> {
-        Arc::new(Self {
-            sys_gain_bits: AtomicU32::new(levels.system_gain.to_bits()),
-            mic_gain_bits: AtomicU32::new(levels.mic_gain.to_bits()),
-            sys_mute: AtomicBool::new(levels.system_muted),
-            mic_mute: AtomicBool::new(levels.mic_muted),
-            peak_bits: AtomicU32::new(0),
-        })
-    }
-
-    pub fn snapshot(&self) -> MixerLevels {
-        MixerLevels {
-            system_gain: f32::from_bits(self.sys_gain_bits.load(Ordering::Relaxed)),
-            mic_gain: f32::from_bits(self.mic_gain_bits.load(Ordering::Relaxed)),
-            system_muted: self.sys_mute.load(Ordering::Relaxed),
-            mic_muted: self.mic_mute.load(Ordering::Relaxed),
-        }
-    }
-
-    pub fn set_gain_db(&self, mic: bool, db: f32) {
-        let bits = MixerLevels::db_to_linear(db).to_bits();
-        if mic {
-            self.mic_gain_bits.store(bits, Ordering::Relaxed);
-        } else {
-            self.sys_gain_bits.store(bits, Ordering::Relaxed);
-        }
-    }
-
-    pub fn gain_db(&self, mic: bool) -> f32 {
-        let lin = if mic {
-            f32::from_bits(self.mic_gain_bits.load(Ordering::Relaxed))
-        } else {
-            f32::from_bits(self.sys_gain_bits.load(Ordering::Relaxed))
-        };
-        if lin <= 0.0 {
-            -60.0
-        } else {
-            20.0 * lin.log10()
-        }
-    }
-
-    pub fn set_muted(&self, mic: bool, muted: bool) {
-        if mic {
-            self.mic_mute.store(muted, Ordering::Relaxed);
-        } else {
-            self.sys_mute.store(muted, Ordering::Relaxed);
-        }
-    }
-
-    pub fn muted(&self, mic: bool) -> bool {
-        if mic {
-            self.mic_mute.load(Ordering::Relaxed)
-        } else {
-            self.sys_mute.load(Ordering::Relaxed)
-        }
-    }
-
-    pub fn observe_peak(&self, peak: f32) {
-        self.peak_bits
-            .fetch_max(peak.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
-    }
-
-    /// Drain the accumulated peak (returns 0.0 if the mixer added nothing).
-    pub fn take_peak(&self) -> f32 {
-        f32::from_bits(self.peak_bits.swap(0, Ordering::Relaxed))
-    }
-}
-
-/// Runtime stats for the final log line / future VU meters.
-#[derive(Debug, Default)]
-pub struct AudioStats {
-    pub quanta_emitted: u64,
-    pub sys_underruns: u64,
-    pub mic_underruns: u64,
-    pub mic_packets_dropped: u64,
 }
 
 /// Live pipeline. `mixed_rx` yields consecutive 1920-byte i16-stereo-48k chunks.
@@ -161,13 +70,6 @@ impl WinAudioPipeline {
     }
 }
 
-/// Raw mic packet from the cpal callback thread (device rate/channels, f32).
-struct MicPacket {
-    data: Vec<f32>,
-    channels: usize,
-    rate: u32,
-}
-
 /// Start the pipeline. Returns an error if a *requested* source fails
 /// (mic not found, mixer thread spawn) — the caller decides fail-soft vs bail.
 /// Note: loopback *runtime* loss is always soft (mixer warns and goes silent).
@@ -183,34 +85,29 @@ pub fn start_pipeline(config: WinAudioConfig) -> Result<WinAudioPipeline, AudioE
     if let Some(query) = config.mic_query.clone() {
         thread::Builder::new()
             .name("qcapture-mic-validate".into())
-            .spawn(move || check_mic_exists(&query))
+            .spawn(move || cpal_in::check_mic_exists(&query))
             .map_err(|e| AudioError::Backend(format!("validator spawn: {e}")))?
             .join()
             .map_err(|_| AudioError::Backend("mic validator panicked".into()))??;
     }
 
-    // Mic packets flow callback-thread -> mixer-thread.
-    let (mic_tx, mic_rx) = flume::bounded::<MicPacket>(64);
-    let mic_dropped = Arc::new(AtomicU64::new(0));
-    let mic_stop = Arc::new(AtomicBool::new(false));
-
-    // cpal stream must live on its own thread; keep the JoinHandle out of the
-    // mixer so a stuck device doesn't block shutdown (we only signal + detach).
-    let mic_query = config.mic_query.clone();
-    if let Some(query) = mic_query {
-        let tx = mic_tx.clone();
-        let stop = mic_stop.clone();
-        let dropped = mic_dropped.clone();
-        thread::Builder::new()
-            .name("qcapture-mic".into())
-            .spawn(move || {
-                if let Err(e) = mic_thread_main(&query, tx, stop, dropped) {
-                    tracing::warn!("mic thread exited: {e}");
-                }
-            })
-            .map_err(|e| AudioError::Backend(format!("mic thread spawn: {e}")))?;
-    }
-    drop(mic_tx);
+    // Mic packets flow callback-thread -> mixer-thread. The cpal stream must
+    // live on its own thread; the JoinHandle stays out of the mixer so a
+    // stuck device doesn't block shutdown (we only signal + detach).
+    let (mic_rx, mic_stop, mic_dropped) = match config.mic_query.clone() {
+        Some(query) => {
+            let (rx, stop, dropped) = cpal_in::spawn_packet_thread(&query, "qcapture-mic")?;
+            (rx, stop, dropped)
+        }
+        None => {
+            let (_, rx) = flume::bounded::<MicPacket>(64);
+            (
+                rx,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU64::new(0)),
+            )
+        }
+    };
 
     // Unbounded: the capture handler drains at WGC frame rate (100+/s) while we
     // produce 100 chunks/s, so backlog only grows if the encoder itself stalls —
@@ -246,171 +143,6 @@ pub fn start_pipeline(config: WinAudioConfig) -> Result<WinAudioPipeline, AudioE
         handle: Some(handle),
         stats,
     })
-}
-
-// ---------------------------------------------------------------------------
-// Mic (cpal) thread
-// ---------------------------------------------------------------------------
-
-/// Synchronous mic lookup with the same matching rule as the capture thread.
-/// Called at pipeline start so an explicit `--mic typo` bails instead of
-/// silently recording without the mic.
-pub fn check_mic_exists(query: &str) -> Result<(), AudioError> {
-    use cpal::traits::HostTrait;
-    let host = cpal::default_host();
-    if query.eq_ignore_ascii_case("default") || query.is_empty() {
-        return host
-            .default_input_device()
-            .map(|_| ())
-            .ok_or_else(|| AudioError::NoHost("no default input device".into()));
-    }
-    let lower = query.to_lowercase();
-    let found = host
-        .input_devices()
-        .map_err(|e| AudioError::Backend(e.to_string()))?
-        .any(|d| d.to_string().to_lowercase().contains(&lower));
-    if found {
-        Ok(())
-    } else {
-        Err(AudioError::Backend(format!(
-            "mic '{query}' not found — see `qcapture --list-audio`"
-        )))
-    }
-}
-
-fn mic_thread_main(
-    query: &str,
-    tx: flume::Sender<MicPacket>,
-    stop: Arc<AtomicBool>,
-    dropped: Arc<AtomicU64>,
-) -> Result<(), AudioError> {
-    use cpal::traits::{DeviceTrait, HostTrait};
-
-    let host = cpal::default_host();
-    let device = if query.eq_ignore_ascii_case("default") || query.is_empty() {
-        host.default_input_device()
-            .ok_or_else(|| AudioError::NoHost("no default input device".into()))?
-    } else {
-        let lower = query.to_lowercase();
-        host.input_devices()
-            .map_err(|e| AudioError::Backend(e.to_string()))?
-            .find(|d| d.to_string().to_lowercase().contains(&lower))
-            .ok_or_else(|| {
-                AudioError::Backend(format!(
-                    "mic '{query}' not found — see `qcapture --list-audio`"
-                ))
-            })?
-    };
-    tracing::info!("mic device: {}", device.to_string());
-
-    // Pick config: F32 > I16 > U16, rate closest to 48 k, stereo preferred.
-    let mut best: Option<(i32, cpal::SupportedStreamConfigRange)> = None;
-    let ranges = device
-        .supported_input_configs()
-        .map_err(|e| AudioError::Backend(e.to_string()))?;
-    for r in ranges {
-        let fmt_score = match r.sample_format() {
-            cpal::SampleFormat::F32 => 0,
-            cpal::SampleFormat::I16 => 1,
-            cpal::SampleFormat::U16 => 2,
-            _ => continue,
-        };
-        let rate = 48000u32.clamp(r.min_sample_rate(), r.max_sample_rate());
-        let rate_dist = rate.abs_diff(48000) as i32;
-        let ch_pen = match r.channels() {
-            2 => 0,
-            1 => 500,
-            _ => 2000,
-        };
-        let score = fmt_score * 1_000_000 + rate_dist + ch_pen;
-        if best.as_ref().is_none_or(|(s, _)| score < *s) {
-            best = Some((score, r));
-        }
-    }
-    let range = best
-        .map(|(_, r)| r)
-        .ok_or_else(|| AudioError::Backend("mic has no usable input config".into()))?;
-    let rate = 48000u32.clamp(range.min_sample_rate(), range.max_sample_rate());
-    let cfg = range.with_sample_rate(rate);
-    tracing::info!("mic config: {cfg:?}");
-
-    // cpal 0.18 selects the callback sample type at compile time per format,
-    // so dispatch explicitly (see build_typed_stream).
-    build_typed_stream(&device, &cfg, tx, stop, dropped)
-}
-
-fn build_typed_stream(
-    device: &cpal::Device,
-    cfg: &cpal::SupportedStreamConfig,
-    tx: flume::Sender<MicPacket>,
-    stop: Arc<AtomicBool>,
-    dropped: Arc<AtomicU64>,
-) -> Result<(), AudioError> {
-    use cpal::traits::{DeviceTrait, StreamTrait};
-    let channels = cfg.channels() as usize;
-    let rate = cfg.sample_rate();
-    let config: cpal::StreamConfig = (*cfg).into();
-
-    let stop_cb = stop.clone();
-    let send_f32 = move |samples: Vec<f32>| {
-        if stop_cb.load(Ordering::Relaxed) {
-            return;
-        }
-        if tx
-            .try_send(MicPacket {
-                data: samples,
-                channels,
-                rate,
-            })
-            .is_err()
-        {
-            dropped.fetch_add(1, Ordering::Relaxed);
-        }
-    };
-
-    let stream = match cfg.sample_format() {
-        cpal::SampleFormat::F32 => device
-            .build_input_stream(
-                config,
-                move |data: &[f32], _| send_f32(data.to_vec()),
-                |e| tracing::warn!("mic stream error: {e}"),
-                None,
-            )
-            .map_err(|e| AudioError::Backend(e.to_string()))?,
-        cpal::SampleFormat::I16 => {
-            let send = send_f32;
-            device
-                .build_input_stream(
-                    config,
-                    move |data: &[i16], _| send(data.iter().map(|&s| s as f32 / 32768.0).collect()),
-                    |e| tracing::warn!("mic stream error: {e}"),
-                    None,
-                )
-                .map_err(|e| AudioError::Backend(e.to_string()))?
-        }
-        cpal::SampleFormat::U16 => {
-            let send = send_f32;
-            device
-                .build_input_stream(
-                    config,
-                    move |data: &[u16], _| {
-                        send(data.iter().map(|&s| s as f32 / 32768.0 - 1.0).collect())
-                    },
-                    |e| tracing::warn!("mic stream error: {e}"),
-                    None,
-                )
-                .map_err(|e| AudioError::Backend(e.to_string()))?
-        }
-        _ => return Err(AudioError::Backend("unsupported mic sample format".into())),
-    };
-    stream
-        .play()
-        .map_err(|e| AudioError::Backend(e.to_string()))?;
-    // Park until shutdown; the cpal callback threads do the work.
-    while !stop.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_millis(50));
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -553,74 +285,6 @@ fn mixer_thread_main(
     );
 }
 
-fn truncate_fifo(fifo: &mut VecDeque<f32>) {
-    let cap = MAX_FIFO_FRAMES * 2;
-    if fifo.len() > cap {
-        let drop_n = fifo.len() - cap;
-        fifo.drain(..drop_n);
-    }
-}
-
-/// Push device-channel audio as interleaved stereo f32.
-fn push_channels_as_stereo(fifo: &mut VecDeque<f32>, data: &[f32], channels: usize) {
-    if channels == 0 {
-        return;
-    }
-    if channels == 1 {
-        for &s in data {
-            fifo.push_back(s);
-            fifo.push_back(s);
-        }
-    } else {
-        for frame in data.chunks(channels) {
-            fifo.push_back(frame[0]);
-            fifo.push_back(frame.get(1).copied().unwrap_or(frame[0]));
-        }
-    }
-}
-
-/// Pull exactly `QUANTUM_FRAMES` stereo frames from `fifo` (device rate
-/// `in_rate`), linear-resampling into `out` (48 kHz). Zero-pads shortfall and
-/// returns false on underrun (caller counts). `pos` carries fractional phase
-/// across quanta for click-free continuity.
-fn pull_resampled(
-    fifo: &mut VecDeque<f32>,
-    pos: &mut f64,
-    in_rate: u32,
-    out: &mut [f32],
-    _ch: usize,
-) -> bool {
-    debug_assert_eq!(out.len(), QUANTUM_FRAMES * 2);
-    let step = in_rate as f64 / OUT_RATE as f64;
-    let avail_frames = fifo.len() / 2;
-    // Last output frame reads index `pos + step*(N-1)` plus one lookahead for lerp.
-    let need_frames = (*pos + step * (QUANTUM_FRAMES - 1) as f64).ceil() as usize + 1;
-    let underrun = avail_frames < need_frames;
-
-    for i in 0..QUANTUM_FRAMES {
-        let idx = *pos as usize;
-        let frac = (*pos - idx as f64) as f32;
-        let l0 = fifo.get(idx * 2).copied().unwrap_or(0.0);
-        let r0 = fifo.get(idx * 2 + 1).copied().unwrap_or(0.0);
-        let l1 = fifo.get(idx * 2 + 2).copied().unwrap_or(0.0);
-        let r1 = fifo.get(idx * 2 + 3).copied().unwrap_or(0.0);
-        out[i * 2] = l0 + (l1 - l0) * frac;
-        out[i * 2 + 1] = r0 + (r1 - r0) * frac;
-        *pos += step;
-    }
-    // Drop consumed frames; on underrun reset phase to self-heal.
-    if underrun {
-        fifo.clear();
-        *pos = 0.0;
-        false
-    } else {
-        let consumed = (*pos as usize).min(avail_frames);
-        fifo.drain(..consumed * 2);
-        *pos -= consumed as f64;
-        true
-    }
-}
-
 // ---------------------------------------------------------------------------
 // WASAPI loopback reader (render endpoint, shared-events, autoconvert to
 // f32 stereo 48 kHz so no resampling is needed on the hot path)
@@ -720,59 +384,5 @@ impl LoopbackReader {
 impl Drop for LoopbackReader {
     fn drop(&mut self) {
         let _ = self.client.stop_stream();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stereo_convert_mono_dup() {
-        let mut fifo = VecDeque::new();
-        push_channels_as_stereo(&mut fifo, &[0.5, -0.5], 1);
-        assert_eq!(fifo.len(), 4);
-        assert_eq!([fifo[0], fifo[1], fifo[2], fifo[3]], [0.5, 0.5, -0.5, -0.5]);
-    }
-
-    #[test]
-    fn stereo_convert_multichannel_takes_lr() {
-        let mut fifo = VecDeque::new();
-        push_channels_as_stereo(&mut fifo, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 3);
-        assert_eq!(fifo.len(), 4);
-        assert_eq!([fifo[0], fifo[1], fifo[2], fifo[3]], [1.0, 2.0, 4.0, 5.0]);
-    }
-
-    #[test]
-    fn resample_passthrough_48k() {
-        let data: Vec<f32> = (0..960).map(|i| i as f32 / 960.0).collect();
-        let mut fifo: VecDeque<f32> = data.into();
-        let mut pos = 0.0;
-        let mut out = vec![0.0; QUANTUM_FRAMES * 2];
-        assert!(pull_resampled(&mut fifo, &mut pos, 48000, &mut out, 0));
-        // step=1.0: output frame i == input frame i (frac 0).
-        // Stereo layout: frame i = samples (2i, 2i+1) = (2i/960, (2i+1)/960).
-        assert!((out[0] - 0.0).abs() < 1e-5);
-        assert!((out[2] - 2.0 / 960.0).abs() < 1e-4);
-        assert!((out[3] - 3.0 / 960.0).abs() < 1e-4);
-    }
-
-    #[test]
-    fn resample_underrun_zero_pads_and_heals() {
-        let mut fifo: VecDeque<f32> = VecDeque::new();
-        let mut pos = 0.0;
-        let mut out = vec![0.0; QUANTUM_FRAMES * 2];
-        assert!(!pull_resampled(&mut fifo, &mut pos, 48000, &mut out, 0));
-        assert!(out.iter().all(|&s| s == 0.0));
-        // Healed: new data flows normally.
-        let data: Vec<f32> = vec![0.25; 960 + 4];
-        fifo.extend(data);
-        assert!(pull_resampled(&mut fifo, &mut pos, 48000, &mut out, 0));
-        assert!((out[0] - 0.25).abs() < 1e-5);
-    }
-
-    #[test]
-    fn db_gains_match_mixer() {
-        assert!((MixerLevels::db_to_linear(-6.0) - 0.5012).abs() < 1e-3);
     }
 }

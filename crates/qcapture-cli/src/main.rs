@@ -231,14 +231,7 @@ fn main() -> anyhow::Result<()> {
         return run_annotate(args);
     }
     if matches!(cli.command, Some(Commands::Widget)) {
-        #[cfg(windows)]
-        {
-            return qcapture_ui::widget::run().map_err(|e| anyhow::anyhow!("{e}"));
-        }
-        #[cfg(not(windows))]
-        {
-            anyhow::bail!("`widget` on Linux/macOS lands Phase 6. Windows-first MVP.");
-        }
+        return qcapture_ui::widget::run().map_err(|e| anyhow::anyhow!("{e}"));
     }
     if let Some(Commands::AnnotateDemo(args)) = cli.command {
         return run_annotate_demo(args);
@@ -606,28 +599,68 @@ fn default_output() -> String {
     format!("qcapture_{ts}.mp4")
 }
 
-/// Shared audio startup for both record paths (Windows): system loopback on
-/// unless `--no-audio`, mic opt-in. Fail-soft on system-only trouble; loud on
-/// explicit `--mic` typos.
-#[cfg(windows)]
-fn start_cli_audio(
-    args: &RecordArgs,
-) -> anyhow::Result<Option<qcapture_audio::win_audio::WinAudioPipeline>> {
+/// Either OS audio pipeline behind one type so both record paths stay
+/// single-path across platforms (construction still differs per OS).
+enum CliAudio {
+    #[cfg(windows)]
+    Win(qcapture_audio::win_audio::WinAudioPipeline),
+    #[cfg(not(windows))]
+    Port(qcapture_audio::portable::PortAudioPipeline),
+}
+
+impl CliAudio {
+    fn mixed_rx(&self) -> flume::Receiver<Vec<u8>> {
+        match self {
+            #[cfg(windows)]
+            Self::Win(p) => p.mixed_rx(),
+            #[cfg(not(windows))]
+            Self::Port(p) => p.mixed_rx(),
+        }
+    }
+
+    fn shutdown(self) -> qcapture_audio::AudioStats {
+        match self {
+            #[cfg(windows)]
+            Self::Win(p) => p.shutdown(),
+            #[cfg(not(windows))]
+            Self::Port(p) => p.shutdown(),
+        }
+    }
+}
+
+/// Shared audio startup for both record paths: system loopback on unless
+/// `--no-audio`, mic opt-in. Fail-soft on system-only trouble; loud on
+/// explicit `--mic` typos. Backend per OS: WASAPI loopback on Windows,
+/// cpal monitor source on Linux, mic-only on macOS.
+fn start_cli_audio(args: &RecordArgs) -> anyhow::Result<Option<CliAudio>> {
     if args.no_audio {
         return Ok(None);
     }
-    let levels = qcapture_audio::win_audio::SharedLevels::new(qcapture_audio::MixerLevels {
+    let levels = qcapture_audio::SharedLevels::new(qcapture_audio::MixerLevels {
         system_gain: qcapture_audio::MixerLevels::db_to_linear(args.system_gain),
         mic_gain: qcapture_audio::MixerLevels::db_to_linear(args.mic_gain),
         system_muted: args.system_mute,
         mic_muted: args.mic_mute,
     });
-    let cfg = qcapture_audio::win_audio::WinAudioConfig {
-        capture_system: true,
-        mic_query: args.mic.clone(),
-        levels,
+    #[cfg(windows)]
+    let started = {
+        let cfg = qcapture_audio::win_audio::WinAudioConfig {
+            capture_system: true,
+            mic_query: args.mic.clone(),
+            levels,
+        };
+        qcapture_audio::win_audio::start_pipeline(cfg).map(CliAudio::Win)
     };
-    match qcapture_audio::win_audio::start_pipeline(cfg) {
+    #[cfg(not(windows))]
+    let started = {
+        let cfg = qcapture_audio::portable::PortAudioConfig {
+            capture_system: true,
+            mic_query: args.mic.clone(),
+            levels,
+        };
+        qcapture_audio::portable::start_pipeline(cfg).map(CliAudio::Port)
+    };
+    match started {
         Ok(p) => {
             eprintln!(
                 "audio: system loopback on{}",
@@ -650,7 +683,6 @@ fn start_cli_audio(
 
 /// Self-test driver: two scripted strokes through the same channel a mouse
 /// would use. Pixels are asserted by the operator (see Phase 4c notes).
-#[cfg(windows)]
 fn spawn_draw_test_driver(tx: flume::Sender<qcapture_annotate::DrawEvent>, w: u32, h: u32) {
     use qcapture_annotate::{DrawEvent, Rgba, Stroke, Tool};
     let _ = (w, h);
@@ -691,10 +723,49 @@ fn spawn_draw_test_driver(tx: flume::Sender<qcapture_annotate::DrawEvent>, w: u3
         .ok();
 }
 
-/// FFmpeg + eframe draw path (Windows): capture runs on a background thread,
-/// the draw window (live video texture + tools) runs on the main thread.
-/// Closing the draw window stops the recording.
-#[cfg(windows)]
+/// Look up a target display by 0-based screen position (0 = primary).
+/// Shared by all backends so `--screen` means the same thing everywhere.
+fn resolve_display(screen: u32) -> anyhow::Result<qcapture_core::DisplayInfo> {
+    let idx = screen as usize;
+    let displays = qcapture_capture::list_displays()
+        .map_err(|e| anyhow::anyhow!("display enumeration failed: {e}"))?;
+    if idx == 0 {
+        displays
+            .iter()
+            .find(|d| d.is_primary)
+            .or(displays.first())
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("no displays detected"))
+    } else {
+        displays.get(idx).cloned().ok_or_else(|| {
+            anyhow::anyhow!("--screen {idx} out of range ({} displays)", displays.len())
+        })
+    }
+}
+
+/// Resolve a `--encoder` name without MediaFoundation (non-Windows):
+/// explicit vendor kinds pass through, `auto` probes, bare `h264`/`hevc`
+/// pick the best available family member or bail loudly.
+#[cfg(not(windows))]
+fn resolve_unix_encoder(name: &str) -> anyhow::Result<qcapture_core::EncoderKind> {
+    let probe = || qcapture_encode::probe_ffmpeg().map_err(|e| anyhow::anyhow!("{e}"));
+    match name {
+        "auto" => Ok(qcapture_encode::resolve_auto_encoder(&probe()?)),
+        "h264" => qcapture_encode::best_h264(&probe()?).ok_or_else(|| {
+            anyhow::anyhow!("this ffmpeg has no H.264 encoder — see `qcapture --probe-ffmpeg`")
+        }),
+        "hevc" | "h265" => qcapture_encode::best_hevc(&probe()?)
+            .ok_or_else(|| anyhow::anyhow!("this ffmpeg has no HEVC encoder — try --encoder x264")),
+        other => {
+            Ok(qcapture_encode::parse_encoder_kind(other).map_err(|e| anyhow::anyhow!("{e}"))?)
+        }
+    }
+}
+
+/// FFmpeg + eframe draw path: capture runs on a background thread, the draw
+/// window (live video texture + tools) runs on the main thread. Closing the
+/// draw window stops the recording. Backend per OS: WGC on Windows, xcap
+/// bridge elsewhere.
 #[allow(clippy::too_many_arguments)]
 fn run_draw_record(
     args: &RecordArgs,
@@ -706,22 +777,32 @@ fn run_draw_record(
     duration: Option<Duration>,
     stop: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
+    #[cfg(windows)]
     use qcapture_capture::ffmpeg_cap as fc;
+    use qcapture_capture::pump as pc;
+    #[cfg(not(windows))]
+    use qcapture_capture::xcap_cap as xc;
     let info = qcapture_encode::probe_ffmpeg().map_err(|e| anyhow::anyhow!("{e}"))?;
     if !qcapture_encode::supports(kind, &info) {
         anyhow::bail!(
             "this ffmpeg has no {} ({}) — see `qcapture --probe-ffmpeg`",
-            fc::encoder_name(kind),
+            pc::encoder_name(kind),
             info.version_line
         );
     }
     eprintln!(
         "ffmpeg: {} -> {}",
         info.version_line,
-        fc::encoder_name(kind)
+        pc::encoder_name(kind)
     );
-    qcapture_encode::rate_control_args(fc::encoder_name(kind), &rate, args.fps)
+    qcapture_encode::rate_control_args(pc::encoder_name(kind), &rate, args.fps)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    #[cfg(not(windows))]
+    if args.cursor_highlight || args.cursor_ripple {
+        anyhow::bail!(
+            "cursor fx is Windows-only in this release (no portable cursor position API yet)"
+        );
+    }
     let annotate = match &args.annotate {
         Some(path) => {
             let doc =
@@ -735,17 +816,34 @@ fn run_draw_record(
         }
         None => None,
     };
-    // Resolve the window once: feed-size guess for the panel plus the HWND
-    // for cursor mapping (preview resize self-corrects drift; strokes are
-    // norm coords so they survive it).
+    // Resolve the window once: feed-size guess for the panel plus (Windows)
+    // the HWND for cursor mapping (preview resize self-corrects drift;
+    // strokes are norm coords so they survive it).
+    #[cfg(windows)]
     let resolved_window = args
         .window_title
         .as_ref()
         .map(|t| qcapture_capture::resolve_window(t))
         .transpose()
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    #[cfg(not(windows))]
+    let resolved_window: Option<(u32, u32)> = match &args.window_title {
+        Some(title) => {
+            let needle = title.to_lowercase();
+            let found = qcapture_capture::list_windows()
+                .map_err(|e| anyhow::anyhow!("window enumeration failed: {e}"))?
+                .into_iter()
+                .find(|w| w.title.to_lowercase().contains(&needle));
+            match found {
+                Some(w) => Some(((w.width.max(64)) & !1, (w.height.max(64)) & !1)),
+                None => anyhow::bail!("no window matching '{title}'"),
+            }
+        }
+        None => None,
+    };
     // Feed-size guess for the panel (preview resize self-corrects align/clamp
     // and window-size drift; strokes are norm coords so they survive it).
+    #[cfg(windows)]
     let (feed_w, feed_h) = if let Some(res) = &resolved_window {
         (res.w, res.h)
     } else if let Some(r) = &args.region {
@@ -755,24 +853,20 @@ fn run_draw_record(
         }
         ((rect.w & !1).max(64), (rect.h & !1).max(64))
     } else {
-        let idx = if args.screen == 0 {
-            0
-        } else {
-            args.screen as usize
-        };
-        let displays = qcapture_capture::list_displays()
-            .map_err(|e| anyhow::anyhow!("display enumeration failed: {e}"))?;
-        let d = if idx == 0 {
-            displays
-                .iter()
-                .find(|d| d.is_primary)
-                .or(displays.first())
-                .ok_or_else(|| anyhow::anyhow!("no displays detected"))?
-        } else {
-            displays.get(idx).ok_or_else(|| {
-                anyhow::anyhow!("--screen {idx} out of range ({} displays)", displays.len())
-            })?
-        };
+        let d = resolve_display(args.screen)?;
+        (d.width.max(64) & !1, d.height.max(64) & !1)
+    };
+    #[cfg(not(windows))]
+    let (feed_w, feed_h) = if let Some((w, h)) = &resolved_window {
+        (*w, *h)
+    } else if let Some(r) = &args.region {
+        let rect = parse_region(r)?;
+        if rect.x < 0 || rect.y < 0 {
+            anyhow::bail!("--region x,y must be >= 0 (monitor-relative)");
+        }
+        ((rect.w & !1).max(64), (rect.h & !1).max(64))
+    } else {
+        let d = resolve_display(args.screen)?;
         (d.width.max(64) & !1, d.height.max(64) & !1)
     };
     let t0 = Instant::now();
@@ -800,7 +894,7 @@ fn run_draw_record(
     };
     // Draw + preview channels (bounded; preview drops on backpressure).
     let (draw_tx, draw_rx) = flume::bounded::<qcapture_annotate::DrawEvent>(256);
-    let (preview_tx, preview_rx) = flume::bounded::<fc::PreviewFrame>(4);
+    let (preview_tx, preview_rx) = flume::bounded::<pc::PreviewFrame>(4);
     if args.draw_test.is_some() {
         spawn_draw_test_driver(draw_tx.clone(), feed_w, feed_h);
     }
@@ -812,7 +906,10 @@ fn run_draw_record(
     let region_s = args.region.clone();
     let region_screen = args.region_screen;
     let window_s = args.window_title.clone();
+    #[cfg(windows)]
     let window_hwnd = resolved_window.map(|r| r.hwnd);
+    #[cfg(not(windows))]
+    let window_hwnd = None;
     let screen = args.screen;
     let fps = args.fps;
     let stop_t = stop.clone();
@@ -823,7 +920,7 @@ fn run_draw_record(
     std::thread::Builder::new()
         .name("qcapture-draw-capture".into())
         .spawn(move || {
-            let job = |c: Option<(u32, u32)>| fc::FfmpegJob {
+            let job = |c: Option<(u32, u32)>| pc::FfmpegJob {
                 fps,
                 encoder: kind,
                 rate,
@@ -842,27 +939,61 @@ fn run_draw_record(
                 // Window resize mid-record hits the fixed-canvas rule (frames
                 // adapted center crop/pad, encoder never re-inits); the draw
                 // panel keeps working on the initial feed geometry.
-                fc::run_ffmpeg_window(title, job(canvas_t), on_end, Some(draw_rx))
+                #[cfg(windows)]
+                let r = fc::run_ffmpeg_window(title, job(canvas_t), on_end, Some(draw_rx));
+                #[cfg(not(windows))]
+                let r = xc::run_xcap_window(title, job(canvas_t), on_end, Some(draw_rx));
+                r
             } else if let Some(r) = &region_s {
                 match parse_region(r) {
                     Ok(rect) => {
-                        let m = qcapture_capture::wgc_monitor_index(region_screen);
-                        fc::run_ffmpeg_region(
-                            m,
-                            rect.x.max(0) as u32,
-                            rect.y.max(0) as u32,
-                            rect.w,
-                            rect.h,
-                            job(None),
-                            on_end,
-                            Some(draw_rx),
-                        )
+                        #[cfg(windows)]
+                        {
+                            let m = qcapture_capture::wgc_monitor_index(region_screen);
+                            fc::run_ffmpeg_region(
+                                m,
+                                rect.x.max(0) as u32,
+                                rect.y.max(0) as u32,
+                                rect.w,
+                                rect.h,
+                                job(None),
+                                on_end,
+                                Some(draw_rx),
+                            )
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            let d = resolve_display(region_screen);
+                            match d {
+                                Ok(d) => xc::run_xcap_region(
+                                    &d,
+                                    rect.x.max(0) as u32,
+                                    rect.y.max(0) as u32,
+                                    rect.w,
+                                    rect.h,
+                                    job(None),
+                                    on_end,
+                                    Some(draw_rx),
+                                ),
+                                Err(e) => {
+                                    Err(qcapture_capture::CaptureError::Backend(e.to_string()))
+                                }
+                            }
+                        }
                     }
                     Err(e) => Err(qcapture_capture::CaptureError::Backend(e.to_string())),
                 }
             } else {
-                let m = qcapture_capture::wgc_monitor_index(screen);
-                fc::run_ffmpeg_monitor(m, job(canvas_t), on_end, Some(draw_rx))
+                #[cfg(windows)]
+                {
+                    let m = qcapture_capture::wgc_monitor_index(screen);
+                    fc::run_ffmpeg_monitor(m, job(canvas_t), on_end, Some(draw_rx))
+                }
+                #[cfg(not(windows))]
+                match resolve_display(screen) {
+                    Ok(d) => xc::run_xcap_monitor(&d, job(canvas_t), on_end, Some(draw_rx)),
+                    Err(e) => Err(qcapture_capture::CaptureError::Backend(e.to_string())),
+                }
             };
             done_flag_t.store(true, Ordering::SeqCst);
             let _ = cap_tx.send(res);
@@ -912,7 +1043,7 @@ fn run_draw_record(
         win_res.frames_shown,
         el.as_secs_f64(),
         size as f64 / 1_000_000.0,
-        fc::encoder_name(kind),
+        pc::encoder_name(kind),
         fx_note,
         audio_note
     );
@@ -946,9 +1077,9 @@ fn run_draw_record(
     Ok(())
 }
 
-/// FFmpeg HW path (Windows): probe -> availability check -> byte-frame capture
-/// -> rawvideo pipe (+ AAC from the named pipe when audio is on).
-#[cfg(windows)]
+/// FFmpeg HW path: probe -> availability check -> byte-frame capture
+/// -> rawvideo pipe (+ AAC from the OS pipe when audio is on).
+/// Backend per OS: WGC on Windows, xcap bridge elsewhere.
 #[allow(clippy::too_many_arguments)]
 fn run_ffmpeg_record(
     args: &RecordArgs,
@@ -960,24 +1091,34 @@ fn run_ffmpeg_record(
     duration: Option<Duration>,
     stop: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
+    #[cfg(windows)]
     use qcapture_capture::ffmpeg_cap as fc;
+    use qcapture_capture::pump as pc;
+    #[cfg(not(windows))]
+    use qcapture_capture::xcap_cap as xc;
     let info = qcapture_encode::probe_ffmpeg().map_err(|e| anyhow::anyhow!("{e}"))?;
     if !qcapture_encode::supports(kind, &info) {
         anyhow::bail!(
             "this ffmpeg has no {} ({}) — see `qcapture --probe-ffmpeg`",
-            fc::encoder_name(kind),
+            pc::encoder_name(kind),
             info.version_line
         );
     }
     eprintln!(
         "ffmpeg: {} -> {}",
         info.version_line,
-        fc::encoder_name(kind)
+        pc::encoder_name(kind)
     );
     // Dry-run the rate mapping now: bad combos (x264+cqp, qp>51,
     // maxrate<bitrate) must fail before any thread or capture starts.
-    qcapture_encode::rate_control_args(fc::encoder_name(kind), &rate, args.fps)
+    qcapture_encode::rate_control_args(pc::encoder_name(kind), &rate, args.fps)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    #[cfg(not(windows))]
+    if args.cursor_highlight || args.cursor_ripple {
+        anyhow::bail!(
+            "cursor fx is Windows-only in this release (no portable cursor position API yet)"
+        );
+    }
     // Load annotations early: bad JSON must fail before a minute of capture.
     let annotate = match &args.annotate {
         Some(path) => {
@@ -1019,7 +1160,9 @@ fn run_ffmpeg_record(
         }),
     };
     let cursor_fx = qcapture_core::CursorFx::opt(args.cursor_highlight, args.cursor_ripple);
-    // Window HWND for cursor mapping (fail fast: bad title must not record).
+    // Window HWND for cursor mapping (Windows; fail fast: bad title must
+    // not record). Other OSes map nothing (cursor fx rejected above).
+    #[cfg(windows)]
     let cursor_hwnd = args
         .window_title
         .as_ref()
@@ -1027,7 +1170,9 @@ fn run_ffmpeg_record(
         .transpose()
         .map_err(|e| anyhow::anyhow!("{e}"))?
         .map(|r| r.hwnd);
-    let job = |c: Option<(u32, u32)>| fc::FfmpegJob {
+    #[cfg(not(windows))]
+    let cursor_hwnd = None;
+    let job = |c: Option<(u32, u32)>| pc::FfmpegJob {
         fps: args.fps,
         encoder: kind,
         rate,
@@ -1048,26 +1193,57 @@ fn run_ffmpeg_record(
         anyhow::bail!("internal: draw flags reached headless record — use run_draw_record");
     }
     let stats = if let Some(title) = &args.window_title {
-        fc::run_ffmpeg_window(title, job(canvas), on_end, None)?
+        #[cfg(windows)]
+        let s = fc::run_ffmpeg_window(title, job(canvas), on_end, None)?;
+        #[cfg(not(windows))]
+        let s = xc::run_xcap_window(title, job(canvas), on_end, None)?;
+        s
     } else if let Some(r) = &args.region {
         let rect = parse_region(r)?;
         if rect.x < 0 || rect.y < 0 {
             anyhow::bail!("--region x,y must be >= 0 (monitor-relative)");
         }
-        let m = qcapture_capture::wgc_monitor_index(args.region_screen);
-        fc::run_ffmpeg_region(
-            m,
-            rect.x as u32,
-            rect.y as u32,
-            rect.w,
-            rect.h,
-            job(None),
-            on_end,
-            None,
-        )?
+        #[cfg(windows)]
+        let s = {
+            let m = qcapture_capture::wgc_monitor_index(args.region_screen);
+            fc::run_ffmpeg_region(
+                m,
+                rect.x as u32,
+                rect.y as u32,
+                rect.w,
+                rect.h,
+                job(None),
+                on_end,
+                None,
+            )?
+        };
+        #[cfg(not(windows))]
+        let s = {
+            let d = resolve_display(args.region_screen)?;
+            xc::run_xcap_region(
+                &d,
+                rect.x.max(0) as u32,
+                rect.y.max(0) as u32,
+                rect.w,
+                rect.h,
+                job(None),
+                on_end,
+                None,
+            )?
+        };
+        s
     } else {
-        let m = qcapture_capture::wgc_monitor_index(args.screen);
-        fc::run_ffmpeg_monitor(m, job(canvas), on_end, None)?
+        #[cfg(windows)]
+        let s = {
+            let m = qcapture_capture::wgc_monitor_index(args.screen);
+            fc::run_ffmpeg_monitor(m, job(canvas), on_end, None)?
+        };
+        #[cfg(not(windows))]
+        let s = {
+            let d = resolve_display(args.screen)?;
+            xc::run_xcap_monitor(&d, job(canvas), on_end, None)?
+        };
+        s
     };
     // Forwarder + writer drained by now; join the pipe thread, then report.
     if let Some(p) = pipe {
@@ -1099,7 +1275,7 @@ fn run_ffmpeg_record(
         stats.annotated_frames,
         el.as_secs_f64(),
         size as f64 / 1_000_000.0,
-        fc::encoder_name(kind),
+        pc::encoder_name(kind),
         fx_note,
         audio_note
     );
@@ -1135,13 +1311,16 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
         }
     }
 
-    // Encoder routing: auto/h264/hevc stay on the native MediaFoundation path;
-    // vendor selectors go through the ffmpeg rawvideo pipe (+ AAC, Phase 5b).
+    // Encoder routing: auto/h264/hevc stay on the native MediaFoundation path
+    // (Windows); vendor selectors go through the ffmpeg rawvideo pipe.
+    // Off Windows there is no MF — everything resolves to ffmpeg.
     let enc_lower = args.encoder.to_lowercase();
+    #[cfg(windows)]
     enum PathSel {
         Mf { hevc: bool },
         Ffmpeg(qcapture_core::EncoderKind),
     }
+    #[cfg(windows)]
     let mut path = match enc_lower.as_str() {
         "auto" | "h264" => PathSel::Mf { hevc: false },
         "hevc" | "h265" => PathSel::Mf { hevc: true },
@@ -1190,6 +1369,7 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
             path = PathSel::Ffmpeg(kind);
         }
     }
+    #[cfg(windows)]
     if matches!(path, PathSel::Mf { .. }) && !matches!(rate, qcapture_core::RateControl::Cbr { .. })
     {
         anyhow::bail!(
@@ -1220,12 +1400,41 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
     let show_cursor = !args.no_cursor;
     let duration = args.duration.map(Duration::from_secs);
 
-    // Ctrl-C flag shared with the capture thread (windows-capture owns its thread;
-    // the handler polls this flag per frame).
+    // Ctrl-C flag shared with the capture thread (the capture backend owns
+    // its thread; the handler polls this flag per frame).
     let stop = Arc::new(AtomicBool::new(false));
     {
         let stop = stop.clone();
         let _ = ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst));
+    }
+
+    #[cfg(not(windows))]
+    {
+        // No MediaFoundation off Windows: resolve everything to ffmpeg
+        // (probe-backed, so missing HW fails loudly before threads start).
+        let kind = resolve_unix_encoder(&enc_lower)?;
+        if args.draw || args.draw_test.is_some() {
+            return run_draw_record(
+                &args,
+                kind,
+                rate,
+                canvas,
+                &output,
+                show_cursor,
+                duration,
+                stop,
+            );
+        }
+        return run_ffmpeg_record(
+            &args,
+            kind,
+            rate,
+            canvas,
+            &output,
+            show_cursor,
+            duration,
+            stop,
+        );
     }
 
     // Phase 3 audio: system loopback on by default, mic opt-in. Fail-soft —
@@ -1348,11 +1557,5 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
             size as f64 / 1_000_000.0
         );
         Ok(())
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = (canvas, show_cursor, path, duration, stop, output);
-        anyhow::bail!("`record` on Linux/macOS lands Phase 6 (PipeWire/SCKit). Windows-first MVP.");
     }
 }

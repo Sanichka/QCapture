@@ -10,7 +10,7 @@
 //! mid-recording stops the capture gracefully via [`Drop`].
 
 use eframe::egui;
-use qcapture_audio::win_audio::SharedLevels;
+use qcapture_audio::SharedLevels;
 use qcapture_core::{DisplayInfo, Rect, WindowInfo};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -19,7 +19,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 /// Advanced capture settings, shared with the detached Advanced window.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AdvCfg {
     pub fps: u32,
     pub bitrate_kbps: u32,
@@ -32,7 +32,7 @@ pub struct AdvCfg {
     pub maxrate_kbps: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RateSel {
     Cbr,
     Vbr,
@@ -49,9 +49,15 @@ impl RateSel {
             Self::Crf => "CRF",
         }
     }
+
+    /// Every option the Advanced dropdown offers (UI renders from this so
+    /// tests and UI can't drift apart).
+    pub const fn all() -> [Self; 4] {
+        [Self::Cbr, Self::Vbr, Self::Cqp, Self::Crf]
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EncoderSel {
     Auto,
     H264,
@@ -66,6 +72,19 @@ impl EncoderSel {
     /// MediaFoundation path (with audio) vs ffmpeg pipe (video-only in 5a).
     fn is_ffmpeg(self) -> bool {
         matches!(self, Self::Nvenc | Self::Amf | Self::Qsv | Self::X264)
+    }
+
+    /// Every option the Advanced dropdown offers (UI renders from this).
+    pub const fn all() -> [Self; 7] {
+        [
+            Self::Auto,
+            Self::H264,
+            Self::Hevc,
+            Self::Nvenc,
+            Self::Amf,
+            Self::Qsv,
+            Self::X264,
+        ]
     }
 
     fn label(self) -> &'static str {
@@ -97,6 +116,44 @@ impl Default for AdvCfg {
     }
 }
 
+/// Canvas choices the Advanced dropdown offers (None = native feed size).
+pub const CANVAS_OPTIONS: [Option<(u32, u32)>; 3] = [None, Some((1280, 720)), Some((1920, 1080))];
+
+impl AdvCfg {
+    /// Slider ranges, shared by the UI and the tests below.
+    pub const FPS_RANGE: std::ops::RangeInclusive<u32> = 15..=120;
+    pub const BITRATE_RANGE: std::ops::RangeInclusive<u32> = 1000..=50000;
+    pub const MAXRATE_RANGE: std::ops::RangeInclusive<u32> = 1000..=80000;
+    pub const QP_RANGE: std::ops::RangeInclusive<u8> = 0..=51;
+    pub const GAIN_DB_RANGE: std::ops::RangeInclusive<f32> = -60.0..=12.0;
+
+    /// Clamp every numeric field into its slider range. Applied to settings
+    /// loaded from disk (hand-edited files can hold anything); the live
+    /// sliders can never leave range on their own.
+    pub fn sanitize(&mut self) {
+        self.fps = self
+            .fps
+            .clamp(*Self::FPS_RANGE.start(), *Self::FPS_RANGE.end());
+        self.bitrate_kbps = self
+            .bitrate_kbps
+            .clamp(*Self::BITRATE_RANGE.start(), *Self::BITRATE_RANGE.end());
+        self.maxrate_kbps = self
+            .maxrate_kbps
+            .clamp(*Self::MAXRATE_RANGE.start(), *Self::MAXRATE_RANGE.end());
+        self.qp = self
+            .qp
+            .clamp(*Self::QP_RANGE.start(), *Self::QP_RANGE.end());
+        self.crf = self
+            .crf
+            .clamp(*Self::QP_RANGE.start(), *Self::QP_RANGE.end());
+        if let Some((w, h)) = self.canvas {
+            if w < 64 || h < 64 {
+                self.canvas = None;
+            }
+        }
+    }
+}
+
 /// Build the ffmpeg [`RateControl`] from widget settings. MF ignores this
 /// (CBR-only); non-CBR with an MF encoder is rejected at record time.
 fn rate_from_adv(adv: &AdvCfg) -> Result<qcapture_core::RateControl, String> {
@@ -114,8 +171,9 @@ fn rate_from_adv(adv: &AdvCfg) -> Result<qcapture_core::RateControl, String> {
     })
 }
 
-#[derive(Debug, Clone)]
-enum TargetSel {
+/// Widget capture-target selection (also persisted across restarts).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub enum TargetSel {
     Screen(u32),
     Window(String),
     Region { screen: u32, rect: Rect },
@@ -141,17 +199,61 @@ pub fn run() -> Result<(), String> {
         .map(|d| d.name)
         .collect();
 
+    // Restore last session (target, encoder, audio, toggles, folder).
+    // Missing/corrupt file = fresh defaults; out-of-range screens clamp.
+    let saved = super::settings::load();
+    let n_screens = screens.len();
+    let clamp_screen = |s: u32| {
+        if (s as usize) < n_screens.max(1) {
+            s
+        } else {
+            0
+        }
+    };
+    let target = saved
+        .as_ref()
+        .and_then(|s| s.target.clone())
+        .map(|t| match t {
+            TargetSel::Screen(s) => TargetSel::Screen(clamp_screen(s)),
+            TargetSel::Region { screen, rect } => TargetSel::Region {
+                screen: clamp_screen(screen),
+                rect,
+            },
+            w @ TargetSel::Window(_) => w,
+        })
+        .unwrap_or(TargetSel::Screen(0));
+    let region_screen = clamp_screen(saved.as_ref().map(|s| s.region_screen).unwrap_or(0));
+    let levels = SharedLevels::new(qcapture_audio::MixerLevels {
+        system_gain: qcapture_audio::MixerLevels::db_to_linear(
+            saved.as_ref().map(|s| s.sys_gain_db).unwrap_or(0.0),
+        ),
+        mic_gain: qcapture_audio::MixerLevels::db_to_linear(
+            saved.as_ref().map(|s| s.mic_gain_db).unwrap_or(0.0),
+        ),
+        system_muted: saved.as_ref().map(|s| s.sys_muted).unwrap_or(false),
+        mic_muted: saved.as_ref().map(|s| s.mic_muted).unwrap_or(false),
+    });
+    // Hand-edited settings can hold anything — clamp back into slider range.
+    let mut adv = saved
+        .as_ref()
+        .and_then(|s| s.adv.clone())
+        .unwrap_or_default();
+    adv.sanitize();
+
     let app = WidgetApp {
         screens,
         windows,
-        target: TargetSel::Screen(0),
-        window_text: String::new(),
-        region_screen: 0,
-        mic_name: None,
+        target,
+        window_text: saved
+            .as_ref()
+            .map(|s| s.window_text.clone())
+            .unwrap_or_default(),
+        region_screen,
+        mic_name: saved.as_ref().and_then(|s| s.mic_name.clone()),
         mic_options: mics,
-        audio_on: true,
-        levels: SharedLevels::new(qcapture_audio::MixerLevels::default()),
-        adv: Arc::new(Mutex::new(AdvCfg::default())),
+        audio_on: saved.as_ref().map(|s| s.audio_on).unwrap_or(true),
+        levels,
+        adv: Arc::new(Mutex::new(adv)),
         adv_open: Arc::new(AtomicBool::new(false)),
         rec: None,
         last_msg: String::new(),
@@ -159,9 +261,13 @@ pub fn run() -> Result<(), String> {
         pick: Arc::new(Mutex::new(PickState::default())),
         pending_doc: None,
         annotate: Arc::new(Mutex::new(AnnotateState::default())),
-        draw_live: false,
-        cursor_highlight: false,
-        cursor_ripple: false,
+        draw_live: saved.as_ref().map(|s| s.draw_live).unwrap_or(false),
+        cursor_highlight: saved.as_ref().map(|s| s.cursor_highlight).unwrap_or(false),
+        cursor_ripple: saved.as_ref().map(|s| s.cursor_ripple).unwrap_or(false),
+        output_dir: saved
+            .as_ref()
+            .map(|s| s.output_dir.clone())
+            .unwrap_or_default(),
         draw_ui: Arc::new(Mutex::new(None)),
         draw_open: Arc::new(AtomicBool::new(false)),
     };
@@ -200,7 +306,7 @@ struct DrawUiState {
     feed_w: u32,
     feed_h: u32,
     events_tx: flume::Sender<qcapture_annotate::DrawEvent>,
-    preview_rx: flume::Receiver<qcapture_capture::ffmpeg_cap::PreviewFrame>,
+    preview_rx: flume::Receiver<qcapture_capture::pump::PreviewFrame>,
     panel: Option<super::draw_panel::DrawPanel>,
     /// Output path for sidecar saving when recording ends.
     output: String,
@@ -209,7 +315,7 @@ struct DrawUiState {
 /// Capture-side ends of the draw channels, moved into the record thread.
 struct DrawCaptureEnds {
     live_rx: flume::Receiver<qcapture_annotate::DrawEvent>,
-    preview_tx: flume::Sender<qcapture_capture::ffmpeg_cap::PreviewFrame>,
+    preview_tx: flume::Sender<qcapture_capture::pump::PreviewFrame>,
 }
 
 struct WidgetApp {
@@ -238,6 +344,8 @@ struct WidgetApp {
     /// Cursor highlight ring + click ripple (ffmpeg path only, like drawing).
     cursor_highlight: bool,
     cursor_ripple: bool,
+    /// Output folder (empty = current folder). Persisted; editable below.
+    output_dir: String,
     draw_ui: Arc<Mutex<Option<DrawUiState>>>,
     /// Draw viewport visibility (closing it keeps recording; preview drops).
     draw_open: Arc<AtomicBool>,
@@ -262,17 +370,58 @@ impl Drop for WidgetApp {
         if let Some(r) = &self.rec {
             r.stop.store(true, std::sync::atomic::Ordering::SeqCst);
         }
+        self.save_settings();
     }
 }
 
-fn default_output() -> String {
+/// Timestamped filename, optionally inside `dir` (empty = current folder).
+/// Creates the folder so a typo fails fast at record time, not mid-encode.
+fn default_output_in(dir: &str) -> Result<String, String> {
     let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
-    format!("qcapture_{ts}.mp4")
+    let name = format!("qcapture_{ts}.mp4");
+    if dir.trim().is_empty() {
+        return Ok(name);
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("output folder '{dir}': {e}"))?;
+    Ok(std::path::Path::new(dir)
+        .join(name)
+        .to_string_lossy()
+        .into_owned())
 }
 
 impl WidgetApp {
     fn recording(&self) -> bool {
         self.rec.is_some()
+    }
+
+    /// Snapshot everything worth remembering for the next launch.
+    fn snapshot_settings(&self) -> super::settings::PersistedSettings {
+        super::settings::PersistedSettings {
+            version: super::settings::SETTINGS_VERSION,
+            target: Some(self.target.clone()),
+            region_screen: self.region_screen,
+            window_text: self.window_text.clone(),
+            mic_name: self.mic_name.clone(),
+            audio_on: self.audio_on,
+            sys_gain_db: self.levels.gain_db(false),
+            sys_muted: self.levels.muted(false),
+            mic_gain_db: self.levels.gain_db(true),
+            mic_muted: self.levels.muted(true),
+            adv: self.adv.lock().ok().map(|g| g.clone()),
+            draw_live: self.draw_live,
+            cursor_highlight: self.cursor_highlight,
+            cursor_ripple: self.cursor_ripple,
+            output_dir: self.output_dir.clone(),
+        }
+    }
+
+    /// Best-effort persist (a failed save warns; recording never depends on it).
+    /// Called on close (Drop) and at record start so a crash mid-record
+    /// still keeps the setup that launched it.
+    fn save_settings(&self) {
+        if let Err(e) = super::settings::save(&self.snapshot_settings()) {
+            eprintln!("warning: {e}");
+        }
     }
 
     fn poll_done(&mut self) {
@@ -378,6 +527,12 @@ impl WidgetApp {
         if self.rec.is_some() {
             return;
         }
+        // Cursor fx is Windows-only (no portable cursor position API yet).
+        #[cfg(not(windows))]
+        if self.cursor_highlight || self.cursor_ripple {
+            self.last_msg = "cursor fx is Windows-only in this release".to_string();
+            return;
+        }
         // Live-draw feed size must resolve on the UI thread (it owns the
         // screen list). Window targets can't be tracked live yet.
         let draw_feed = if self.draw_live {
@@ -392,7 +547,14 @@ impl WidgetApp {
             None
         };
         let adv = self.adv.lock().map(|g| g.clone()).unwrap_or_default();
-        let output = default_output();
+        let output = match default_output_in(&self.output_dir) {
+            Ok(o) => o,
+            Err(e) => {
+                self.last_msg = e;
+                return;
+            }
+        };
+        self.save_settings();
         let stop = Arc::new(AtomicBool::new(false));
         let done = Arc::new(Mutex::new(None));
         let target = self.target.clone();
@@ -408,11 +570,12 @@ impl WidgetApp {
         let done_t = done.clone();
         let annotate = self.pending_doc.clone();
         let cursor_fx = qcapture_core::CursorFx::opt(self.cursor_highlight, self.cursor_ripple);
+        let screens_t = self.screens.clone();
         // Draw channels: UI keeps tx+rx+panel, capture gets rx+tx.
         let draw_caps = if let Some((fw, fh)) = draw_feed {
             let (draw_tx, draw_rx) = flume::bounded::<qcapture_annotate::DrawEvent>(256);
             let (preview_tx, preview_rx) =
-                flume::bounded::<qcapture_capture::ffmpeg_cap::PreviewFrame>(4);
+                flume::bounded::<qcapture_capture::pump::PreviewFrame>(4);
             let state = DrawUiState {
                 feed_w: (fw & !1).max(64),
                 feed_h: (fh & !1).max(64),
@@ -439,7 +602,7 @@ impl WidgetApp {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     record_thread_body(
                         &target, &adv, &out_path, mic_name, audio_on, levels, annotate, draw_caps,
-                        cursor_fx, stop_t,
+                        cursor_fx, screens_t, stop_t,
                     )
                 }));
                 let msg = match result {
@@ -490,12 +653,13 @@ impl WidgetApp {
             TargetSel::Window(title) => {
                 // Window resize mid-record hits the fixed-canvas rule (frames
                 // adapted center crop/pad, encoder never re-inits); panel
-                // stays on the initial geometry. Prefer the WGC size (what
-                // the encoder inits with) over the xcap list (client area
-                // without borders — ~16px smaller each way).
+                // stays on the initial geometry. Prefer the capture size
+                // (what the encoder inits with) over the list size.
+                #[cfg(windows)]
                 if let Ok((w, h)) = qcapture_capture::window_feed_size(title) {
-                    Ok((w, h))
-                } else if let Some(w) = self.windows.iter().find(|w| w.title == *title) {
+                    return Ok((w, h));
+                }
+                if let Some(w) = self.windows.iter().find(|w| w.title == *title) {
                     Ok((w.width.max(64) & !1, w.height.max(64) & !1))
                 } else {
                     Ok((1280, 720))
@@ -607,6 +771,27 @@ impl WidgetApp {
     }
 }
 
+/// Reveal a saved file in the OS file manager (select it when supported).
+fn open_in_folder(path: &str) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer")
+        .arg(format!("/select,{path}"))
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open")
+        .args(["-R", path])
+        .spawn();
+    #[cfg(target_os = "linux")]
+    {
+        // No ubiquitous select-in-folder on Linux: open the parent dir.
+        let parent = std::path::Path::new(path)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| ".".to_string());
+        let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+    }
+}
+
 fn parse_region_str(s: &str) -> Option<Rect> {
     let p: Vec<&str> = s.split(',').collect();
     if p.len() != 4 {
@@ -622,6 +807,27 @@ fn parse_region_str(s: &str) -> Option<Rect> {
     (!r.is_empty()).then_some(r)
 }
 
+/// Look up a widget screen index (0 = primary) for the portable capture
+/// path (same rule as the CLI `--screen` flag). Non-Windows only (Windows
+/// maps through the 1-based WGC index instead).
+#[cfg(not(windows))]
+fn display_of(screens: &[DisplayInfo], s: u32) -> Result<DisplayInfo, String> {
+    let idx = s as usize;
+    if idx == 0 {
+        screens
+            .iter()
+            .find(|d| d.is_primary)
+            .or(screens.first())
+            .cloned()
+            .ok_or_else(|| "no displays detected".to_string())
+    } else {
+        screens
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| format!("screen {s} not in the display list — reopen the widget"))
+    }
+}
+
 /// Runs on the record thread. Returns the human "Saved …" line.
 #[allow(clippy::too_many_arguments)]
 fn record_thread_body(
@@ -634,10 +840,9 @@ fn record_thread_body(
     annotate: Option<qcapture_annotate::AnnotateDoc>,
     draw_caps: Option<DrawCaptureEnds>,
     cursor_fx: Option<qcapture_core::CursorFx>,
+    screens: Vec<DisplayInfo>,
     stop: Arc<AtomicBool>,
 ) -> Result<String, String> {
-    use qcapture_capture::win_record as rec;
-
     // Staged annotations, live drawing AND cursor fx need the ffmpeg byte
     // path. Auto-switch a native encoder rather than failing: NVENC
     // availability is probed inside the ffmpeg branch.
@@ -658,18 +863,33 @@ fn record_thread_body(
     }
     let adv = &adv_owned;
 
-    // FFmpeg HW path first (audio via named pipe since 5b).
-    if adv.encoder.is_ffmpeg() {
-        let kind = match adv.encoder {
-            EncoderSel::Nvenc => qcapture_core::EncoderKind::H264Nvenc,
-            EncoderSel::Amf => qcapture_core::EncoderKind::H264Amf,
-            EncoderSel::Qsv => qcapture_core::EncoderKind::H264Qsv,
-            EncoderSel::X264 => qcapture_core::EncoderKind::LibX264,
-            _ => unreachable!("is_ffmpeg gate"),
-        };
+    // FFmpeg path: vendor encoders everywhere, plus everything off Windows
+    // (no MediaFoundation there — probe-backed resolve, fails loudly).
+    let ffmpeg_kind: Option<qcapture_core::EncoderKind> = match adv.encoder {
+        EncoderSel::Nvenc => Some(qcapture_core::EncoderKind::H264Nvenc),
+        EncoderSel::Amf => Some(qcapture_core::EncoderKind::H264Amf),
+        EncoderSel::Qsv => Some(qcapture_core::EncoderKind::H264Qsv),
+        EncoderSel::X264 => Some(qcapture_core::EncoderKind::LibX264),
+        #[cfg(not(windows))]
+        EncoderSel::Auto | EncoderSel::H264 | EncoderSel::Hevc => {
+            let info = qcapture_encode::probe_ffmpeg().map_err(|e| e.to_string())?;
+            let kind = match adv.encoder {
+                EncoderSel::Auto => qcapture_encode::resolve_auto_encoder(&info),
+                EncoderSel::H264 => qcapture_encode::best_h264(&info)
+                    .ok_or_else(|| "this ffmpeg has no H.264 encoder".to_string())?,
+                _ => qcapture_encode::best_hevc(&info)
+                    .ok_or_else(|| "this ffmpeg has no HEVC encoder".to_string())?,
+            };
+            switched_note = format!(" (using {kind:?} — no MediaFoundation off Windows)");
+            Some(kind)
+        }
+        #[cfg(windows)]
+        EncoderSel::Auto | EncoderSel::H264 | EncoderSel::Hevc => None,
+    };
+    if let Some(kind) = ffmpeg_kind {
         return record_thread_ffmpeg(
             target, adv, output, kind, mic_name, audio_on, levels, annotate, draw_caps, cursor_fx,
-            stop,
+            &screens, stop,
         )
         .map(|m| format!("{m}{switched_note}"));
     }
@@ -680,6 +900,15 @@ fn record_thread_body(
         );
     }
 
+    // Native MediaFoundation path below is Windows-only (off Windows every
+    // encoder resolves to ffmpeg above and never reaches here).
+    #[cfg(not(windows))]
+    {
+        let _ = (&mic_name, &audio_on, &levels);
+        return Err("internal: native encoder off Windows".to_string());
+    }
+
+    #[cfg(windows)]
     let audio = if audio_on {
         let cfg = qcapture_audio::win_audio::WinAudioConfig {
             capture_system: true,
@@ -698,44 +927,31 @@ fn record_thread_body(
     } else {
         None
     };
-    let audio_rx = audio.as_ref().map(|p| p.mixed_rx());
-    let t0 = Instant::now();
+    #[cfg(windows)]
+    {
+        use qcapture_capture::win_record as rec;
+        let audio_rx = audio.as_ref().map(|p| p.mixed_rx());
+        let t0 = Instant::now();
 
-    let use_hevc = adv.encoder == EncoderSel::Hevc;
-    let res = match target {
-        TargetSel::Screen(s) => {
-            let idx = qcapture_capture::wgc_monitor_index(*s);
-            rec::record_monitor(
-                idx,
-                output.to_string(),
-                adv.fps,
-                adv.bitrate_kbps,
-                adv.canvas,
-                adv.show_cursor,
-                use_hevc,
-                audio_rx,
-                None,
-                stop,
-            )
-        }
-        TargetSel::Window(title) => rec::record_window_title(
-            title,
-            output.to_string(),
-            adv.fps,
-            adv.bitrate_kbps,
-            adv.show_cursor,
-            audio_rx,
-            None,
-            stop,
-        ),
-        TargetSel::Region { screen, rect } => {
-            let idx = qcapture_capture::wgc_monitor_index(*screen);
-            rec::record_region(
-                idx,
-                rect.x.max(0) as u32,
-                rect.y.max(0) as u32,
-                rect.w,
-                rect.h,
+        let use_hevc = adv.encoder == EncoderSel::Hevc;
+        let res = match target {
+            TargetSel::Screen(s) => {
+                let idx = qcapture_capture::wgc_monitor_index(*s);
+                rec::record_monitor(
+                    idx,
+                    output.to_string(),
+                    adv.fps,
+                    adv.bitrate_kbps,
+                    adv.canvas,
+                    adv.show_cursor,
+                    use_hevc,
+                    audio_rx,
+                    None,
+                    stop,
+                )
+            }
+            TargetSel::Window(title) => rec::record_window_title(
+                title,
                 output.to_string(),
                 adv.fps,
                 adv.bitrate_kbps,
@@ -743,33 +959,50 @@ fn record_thread_body(
                 audio_rx,
                 None,
                 stop,
-            )
+            ),
+            TargetSel::Region { screen, rect } => {
+                let idx = qcapture_capture::wgc_monitor_index(*screen);
+                rec::record_region(
+                    idx,
+                    rect.x.max(0) as u32,
+                    rect.y.max(0) as u32,
+                    rect.w,
+                    rect.h,
+                    output.to_string(),
+                    adv.fps,
+                    adv.bitrate_kbps,
+                    adv.show_cursor,
+                    audio_rx,
+                    None,
+                    stop,
+                )
+            }
+        };
+        if let Err(e) = res {
+            if let Some(p) = audio {
+                let _ = p.shutdown();
+            }
+            return Err(e.to_string());
         }
-    };
-    if let Err(e) = res {
-        if let Some(p) = audio {
-            let _ = p.shutdown();
-        }
-        return Err(e.to_string());
+
+        let el = t0.elapsed();
+        let size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
+        let audio_note = match audio {
+            Some(p) => {
+                let s = p.shutdown();
+                format!(
+                    " + AAC {} quanta ({} sys/{} mic underruns)",
+                    s.quanta_emitted, s.sys_underruns, s.mic_underruns
+                )
+            }
+            None => String::new(),
+        };
+        Ok(format!(
+            "Saved {output} — {:.1}s, {:.2} MB{audio_note}",
+            el.as_secs_f64(),
+            size as f64 / 1_000_000.0
+        ))
     }
-
-    let el = t0.elapsed();
-    let size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
-    let audio_note = match audio {
-        Some(p) => {
-            let s = p.shutdown();
-            format!(
-                " + AAC {} quanta ({} sys/{} mic underruns)",
-                s.quanta_emitted, s.sys_underruns, s.mic_underruns
-            )
-        }
-        None => String::new(),
-    };
-    Ok(format!(
-        "Saved {output} — {:.1}s, {:.2} MB{audio_note}",
-        el.as_secs_f64(),
-        size as f64 / 1_000_000.0
-    ))
 }
 
 /// FFmpeg HW branch of [`record_thread_body`]: probe, availability check,
@@ -786,33 +1019,55 @@ fn record_thread_ffmpeg(
     annotate: Option<qcapture_annotate::AnnotateDoc>,
     draw_caps: Option<DrawCaptureEnds>,
     cursor_fx: Option<qcapture_core::CursorFx>,
+    _screens: &[DisplayInfo],
     stop: Arc<AtomicBool>,
 ) -> Result<String, String> {
+    #[cfg(windows)]
     use qcapture_capture::ffmpeg_cap as fc;
+    use qcapture_capture::pump as pc;
+    #[cfg(not(windows))]
+    use qcapture_capture::xcap_cap as xc;
     use qcapture_encode::audio_pipe as ap;
     let info = qcapture_encode::probe_ffmpeg().map_err(|e| e.to_string())?;
     if !qcapture_encode::supports(kind, &info) {
         return Err(format!(
             "this ffmpeg has no {} — pick another encoder",
-            fc::encoder_name(kind)
+            pc::encoder_name(kind)
         ));
     }
     // Same dry-run as CLI: fail before threads start.
     qcapture_encode::rate_control_args(
-        fc::encoder_name(kind),
+        pc::encoder_name(kind),
         &rate_from_adv(adv).map_err(|e| e.to_string())?,
         adv.fps,
     )
     .map_err(|e| e.to_string())?;
     // Same pipeline as the MF path; chunks forward into the ffmpeg pipe.
     // Fail-soft like CLI: system-only trouble -> video-only, mic typo -> loud.
+    // Backend per OS: WASAPI loopback on Windows, cpal monitor on Linux,
+    // mic-only on macOS.
     let audio = if audio_on {
-        let cfg = qcapture_audio::win_audio::WinAudioConfig {
-            capture_system: true,
-            mic_query: mic_name.clone(),
-            levels: levels.clone(),
+        #[cfg(windows)]
+        let started = {
+            let cfg = qcapture_audio::win_audio::WinAudioConfig {
+                capture_system: true,
+                mic_query: mic_name.clone(),
+                levels: levels.clone(),
+            };
+            qcapture_audio::win_audio::start_pipeline(cfg)
+                .map(qcapture_audio::AnyAudioPipeline::Win)
         };
-        match qcapture_audio::win_audio::start_pipeline(cfg) {
+        #[cfg(not(windows))]
+        let started = {
+            let cfg = qcapture_audio::portable::PortAudioConfig {
+                capture_system: true,
+                mic_query: mic_name.clone(),
+                levels: levels.clone(),
+            };
+            qcapture_audio::portable::start_pipeline(cfg)
+                .map(qcapture_audio::AnyAudioPipeline::Port)
+        };
+        match started {
             Ok(p) => Some(p),
             Err(e) => {
                 if mic_name.is_some() {
@@ -850,7 +1105,9 @@ fn record_thread_ffmpeg(
         Some(c) => (Some(c.live_rx), Some(c.preview_tx)),
         None => (None, None),
     };
-    // Window HWND for cursor mapping (fail fast on a stale title).
+    // Window HWND for cursor mapping (Windows; fail fast on a stale title).
+    // Other OSes map nothing (cursor fx is Windows-only for now).
+    #[cfg(windows)]
     let cursor_hwnd = match target {
         TargetSel::Window(title) if cursor_fx.is_some() => Some(
             qcapture_capture::resolve_window(title)
@@ -859,7 +1116,9 @@ fn record_thread_ffmpeg(
         ),
         _ => None,
     };
-    let job = |canvas: Option<(u32, u32)>| fc::FfmpegJob {
+    #[cfg(not(windows))]
+    let cursor_hwnd = None;
+    let job = |canvas: Option<(u32, u32)>| pc::FfmpegJob {
         fps: adv.fps,
         encoder: kind,
         rate,
@@ -874,24 +1133,62 @@ fn record_thread_ffmpeg(
         audio_pipe: audio_pipe_name.clone(),
         preview_tx: preview_tx.clone(),
     };
+    // Cursor fx is Windows-only (no portable cursor position API yet).
+    #[cfg(not(windows))]
+    if cursor_fx.is_some() {
+        return Err("cursor fx is Windows-only in this release".to_string());
+    }
     let stats = match target {
         TargetSel::Screen(s) => {
-            let idx = qcapture_capture::wgc_monitor_index(*s);
-            fc::run_ffmpeg_monitor(idx, job(adv.canvas), on_end, draw_rx.take())
+            #[cfg(windows)]
+            let r = {
+                let idx = qcapture_capture::wgc_monitor_index(*s);
+                fc::run_ffmpeg_monitor(idx, job(adv.canvas), on_end, draw_rx.take())
+            };
+            #[cfg(not(windows))]
+            let r = {
+                let d = display_of(_screens, *s)?;
+                xc::run_xcap_monitor(&d, job(adv.canvas), on_end, draw_rx.take())
+            };
+            r
         }
-        TargetSel::Window(title) => fc::run_ffmpeg_window(title, job(None), on_end, draw_rx.take()),
+        TargetSel::Window(title) => {
+            #[cfg(windows)]
+            let r = fc::run_ffmpeg_window(title, job(None), on_end, draw_rx.take());
+            #[cfg(not(windows))]
+            let r = xc::run_xcap_window(title, job(None), on_end, draw_rx.take());
+            r
+        }
         TargetSel::Region { screen, rect } => {
-            let idx = qcapture_capture::wgc_monitor_index(*screen);
-            fc::run_ffmpeg_region(
-                idx,
-                rect.x.max(0) as u32,
-                rect.y.max(0) as u32,
-                rect.w,
-                rect.h,
-                job(None),
-                on_end,
-                draw_rx.take(),
-            )
+            #[cfg(windows)]
+            let r = {
+                let idx = qcapture_capture::wgc_monitor_index(*screen);
+                fc::run_ffmpeg_region(
+                    idx,
+                    rect.x.max(0) as u32,
+                    rect.y.max(0) as u32,
+                    rect.w,
+                    rect.h,
+                    job(None),
+                    on_end,
+                    draw_rx.take(),
+                )
+            };
+            #[cfg(not(windows))]
+            let r = {
+                let d = display_of(_screens, *screen)?;
+                xc::run_xcap_region(
+                    &d,
+                    rect.x.max(0) as u32,
+                    rect.y.max(0) as u32,
+                    rect.w,
+                    rect.h,
+                    job(None),
+                    on_end,
+                    draw_rx.take(),
+                )
+            };
+            r
         }
     }
     .map_err(|e| e.to_string())?;
@@ -917,6 +1214,65 @@ fn record_thread_ffmpeg(
         fc::encoder_name(kind),
         audio_note
     ))
+}
+
+/// Advanced window body: fps/bitrate sliders, rate-control/canvas/encoder
+/// dropdowns, cursor toggle. Free function (not a method) so headless UI
+/// tests drive the exact same controls the production viewport shows.
+fn show_advanced_panel(ui: &mut egui::Ui, a: &mut AdvCfg) {
+    ui.heading("Advanced");
+    ui.add(egui::Slider::new(&mut a.fps, AdvCfg::FPS_RANGE).text("fps"));
+    ui.add(
+        egui::Slider::new(&mut a.bitrate_kbps, AdvCfg::BITRATE_RANGE)
+            .text("bitrate kbps (CBR/VBR target)"),
+    );
+    egui::ComboBox::from_label("Rate control")
+        .selected_text(a.rc.label())
+        .show_ui(ui, |ui| {
+            for r in RateSel::all() {
+                ui.selectable_value(&mut a.rc, r, r.label());
+            }
+        });
+    match a.rc {
+        RateSel::Cbr => {}
+        RateSel::Vbr => {
+            ui.add(
+                egui::Slider::new(&mut a.maxrate_kbps, AdvCfg::MAXRATE_RANGE).text("maxrate kbps"),
+            );
+        }
+        RateSel::Cqp => {
+            ui.add(egui::Slider::new(&mut a.qp, AdvCfg::QP_RANGE).text("QP (lower=better)"));
+            ui.label("CQP: NVENC/AMF/QSV (x264 uses CRF).");
+        }
+        RateSel::Crf => {
+            ui.add(egui::Slider::new(&mut a.crf, AdvCfg::QP_RANGE).text("CRF (lower=better)"));
+            ui.label("CRF: x264 only.");
+        }
+    }
+    ui.label("VBR/CQP/CRF need an ffmpeg encoder; MF is CBR-only.");
+    egui::ComboBox::from_label("Canvas")
+        .selected_text(match a.canvas {
+            None => "Native".to_string(),
+            Some((w, h)) => format!("{w}x{h}"),
+        })
+        .show_ui(ui, |ui| {
+            for c in CANVAS_OPTIONS {
+                let label = match c {
+                    None => "Native".to_string(),
+                    Some((w, h)) => format!("{w}x{h}"),
+                };
+                ui.selectable_value(&mut a.canvas, c, label);
+            }
+        });
+    egui::ComboBox::from_label("Encoder")
+        .selected_text(a.encoder.label())
+        .show_ui(ui, |ui| {
+            for e in EncoderSel::all() {
+                ui.selectable_value(&mut a.encoder, e, e.label());
+            }
+        });
+    ui.checkbox(&mut a.show_cursor, "Capture cursor");
+    ui.label("ffmpeg entries mix AAC via named pipe.");
 }
 
 impl eframe::App for WidgetApp {
@@ -946,80 +1302,7 @@ impl eframe::App for WidgetApp {
                 move |ctx, _| {
                     if let Ok(mut a) = adv.lock() {
                         egui::CentralPanel::default().show(ctx, |ui| {
-                            ui.heading("Advanced");
-                            ui.add(egui::Slider::new(&mut a.fps, 15..=120).text("fps"));
-                            ui.add(
-                                egui::Slider::new(&mut a.bitrate_kbps, 1000..=50000)
-                                    .text("bitrate kbps (CBR/VBR target)"),
-                            );
-                            egui::ComboBox::from_label("Rate control")
-                                .selected_text(a.rc.label())
-                                .show_ui(ui, |ui| {
-                                    for r in
-                                        [RateSel::Cbr, RateSel::Vbr, RateSel::Cqp, RateSel::Crf]
-                                    {
-                                        ui.selectable_value(&mut a.rc, r, r.label());
-                                    }
-                                });
-                            match a.rc {
-                                RateSel::Cbr => {}
-                                RateSel::Vbr => {
-                                    ui.add(
-                                        egui::Slider::new(&mut a.maxrate_kbps, 1000..=80000)
-                                            .text("maxrate kbps"),
-                                    );
-                                }
-                                RateSel::Cqp => {
-                                    ui.add(
-                                        egui::Slider::new(&mut a.qp, 0..=51)
-                                            .text("QP (lower=better)"),
-                                    );
-                                    ui.label("CQP: NVENC/AMF/QSV (x264 uses CRF).");
-                                }
-                                RateSel::Crf => {
-                                    ui.add(
-                                        egui::Slider::new(&mut a.crf, 0..=51)
-                                            .text("CRF (lower=better)"),
-                                    );
-                                    ui.label("CRF: x264 only.");
-                                }
-                            }
-                            ui.label("VBR/CQP/CRF need an ffmpeg encoder; MF is CBR-only.");
-                            egui::ComboBox::from_label("Canvas")
-                                .selected_text(match a.canvas {
-                                    None => "Native".to_string(),
-                                    Some((w, h)) => format!("{w}x{h}"),
-                                })
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut a.canvas, None, "Native");
-                                    ui.selectable_value(
-                                        &mut a.canvas,
-                                        Some((1280, 720)),
-                                        "1280x720",
-                                    );
-                                    ui.selectable_value(
-                                        &mut a.canvas,
-                                        Some((1920, 1080)),
-                                        "1920x1080",
-                                    );
-                                });
-                            egui::ComboBox::from_label("Encoder")
-                                .selected_text(a.encoder.label())
-                                .show_ui(ui, |ui| {
-                                    for e in [
-                                        EncoderSel::Auto,
-                                        EncoderSel::H264,
-                                        EncoderSel::Hevc,
-                                        EncoderSel::Nvenc,
-                                        EncoderSel::Amf,
-                                        EncoderSel::Qsv,
-                                        EncoderSel::X264,
-                                    ] {
-                                        ui.selectable_value(&mut a.encoder, e, e.label());
-                                    }
-                                });
-                            ui.checkbox(&mut a.show_cursor, "Capture cursor");
-                            ui.label("ffmpeg entries mix AAC via named pipe.");
+                            show_advanced_panel(ui, &mut a);
                         });
                     }
                     if ctx.input(|i| i.viewport().close_requested()) {
@@ -1104,10 +1387,33 @@ impl eframe::App for WidgetApp {
                     {
                         self.target = TargetSel::Window(self.window_text.clone());
                     }
-                    let _ = ui.selectable_label(
-                        matches!(self.target, TargetSel::Region { .. }),
-                        "Region",
-                    );
+                    if ui
+                        .selectable_label(
+                            matches!(self.target, TargetSel::Region { .. }),
+                            "Region",
+                        )
+                        .clicked()
+                        && !matches!(self.target, TargetSel::Region { .. })
+                    {
+                        // Select mode only: whole current screen as the initial
+                        // rect (immediately recordable); refine via Select region.
+                        let screen = match &self.target {
+                            TargetSel::Screen(s) => *s,
+                            TargetSel::Region { screen, .. } => *screen,
+                            TargetSel::Window(_) => self.region_screen,
+                        };
+                        let (w, h) = self
+                            .screens
+                            .get(screen as usize)
+                            .map(|d| (d.width, d.height))
+                            .unwrap_or((1920, 1080));
+                        self.region_screen = screen;
+                        self.target = TargetSel::Region {
+                            screen,
+                            rect: Rect::new(0, 0, w, h),
+                        };
+                        self.last_msg = format!("region 0,0 {w}x{h} (full screen)");
+                    }
                 });
             });
 
@@ -1223,7 +1529,10 @@ impl eframe::App for WidgetApp {
                     let mut db = self.levels.gain_db(false);
                     ui.label("Sys");
                     if ui
-                        .add(egui::Slider::new(&mut db, -60.0..=12.0).show_value(false))
+                        .add(
+                            egui::Slider::new(&mut db, AdvCfg::GAIN_DB_RANGE)
+                                .show_value(false),
+                        )
                         .changed()
                     {
                         self.levels.set_gain_db(false, db);
@@ -1257,7 +1566,7 @@ impl eframe::App for WidgetApp {
                     let mut db = self.levels.gain_db(true);
                     if ui
                         .add(
-                            egui::Slider::new(&mut db, -60.0..=12.0)
+                            egui::Slider::new(&mut db, AdvCfg::GAIN_DB_RANGE)
                                 .show_value(false)
                                 .text("Mic"),
                         )
@@ -1285,6 +1594,8 @@ impl eframe::App for WidgetApp {
                             "Live video + pen/shapes/text in a second window (ffmpeg encoders; closing it keeps recording)",
                         );
                 });
+                // Cursor fx is Windows-only (no portable cursor position API).
+                #[cfg(windows)]
                 ui.horizontal(|ui| {
                     ui.label("Cursor fx:");
                     ui.checkbox(&mut self.cursor_highlight, "highlight").on_hover_text(
@@ -1293,6 +1604,23 @@ impl eframe::App for WidgetApp {
                     ui.checkbox(&mut self.cursor_ripple, "clicks").on_hover_text(
                         "White ripple on mouse clicks, burned into the video (ffmpeg encoders)",
                     );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Folder:");
+                    ui.text_edit_singleline(&mut self.output_dir)
+                        .on_hover_text("Output folder for recordings (empty = current folder)");
+                    if ui
+                        .small_button("…")
+                        .on_hover_text("Pick output folder…")
+                        .clicked()
+                    {
+                        if let Some(dir) = rfd::FileDialog::new()
+                            .set_title("QCapture output folder")
+                            .pick_folder()
+                        {
+                            self.output_dir = dir.to_string_lossy().into_owned();
+                        }
+                    }
                 });
                 if ui
                     .add_sized([340.0, 36.0], egui::Button::new("●  Record"))
@@ -1335,9 +1663,7 @@ impl eframe::App for WidgetApp {
                 ui.label(&self.last_msg);
                 if self.last_msg.starts_with("Saved ") && ui.small_button("Open folder").clicked() {
                     if let Some(path) = self.last_saved_path() {
-                        let _ = std::process::Command::new("explorer")
-                            .arg(format!("/select,{path}"))
-                            .spawn();
+                        open_in_folder(&path);
                     }
                 }
             }
@@ -1354,9 +1680,6 @@ impl eframe::App for WidgetApp {
                     .clicked()
                 {
                     self.adv_open.store(!open, Ordering::Relaxed);
-                }
-                if ui.small_button("Pick region…").clicked() {
-                    self.launch_pick_region(ctx);
                 }
                 if ui
                     .small_button("Annotate…")
@@ -1388,5 +1711,537 @@ impl WidgetApp {
             .strip_prefix("Saved ")
             .and_then(|s| s.split(" — ").next())
             .map(|s| s.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui::{Event, Modifiers, PointerButton, Pos2};
+    use egui_kittest::{kittest::Queryable, Harness};
+
+    fn test_screens() -> Vec<DisplayInfo> {
+        vec![
+            DisplayInfo {
+                id: 0,
+                name: "TestA".into(),
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+                scale_factor: 1.0,
+                is_primary: true,
+                refresh_hz: Some(60),
+            },
+            DisplayInfo {
+                id: 1,
+                name: "TestB".into(),
+                x: 1920,
+                y: 0,
+                width: 1280,
+                height: 720,
+                scale_factor: 1.0,
+                is_primary: false,
+                refresh_hz: Some(60),
+            },
+        ]
+    }
+
+    fn test_app() -> WidgetApp {
+        WidgetApp {
+            screens: test_screens(),
+            windows: vec![WindowInfo {
+                id: 7,
+                title: "Notepad doc".into(),
+                app_name: "np".into(),
+                x: 0,
+                y: 0,
+                width: 800,
+                height: 600,
+                minimized: false,
+            }],
+            target: TargetSel::Screen(0),
+            window_text: String::new(),
+            region_screen: 0,
+            mic_name: None,
+            mic_options: vec!["Mic A".into(), "USB Mic".into()],
+            audio_on: true,
+            levels: SharedLevels::new(qcapture_audio::MixerLevels::default()),
+            adv: Arc::new(Mutex::new(AdvCfg::default())),
+            adv_open: Arc::new(AtomicBool::new(false)),
+            rec: None,
+            last_msg: String::new(),
+            vu: 0.0,
+            pick: Arc::new(Mutex::new(PickState::default())),
+            pending_doc: None,
+            annotate: Arc::new(Mutex::new(AnnotateState::default())),
+            draw_live: false,
+            cursor_highlight: false,
+            cursor_ripple: false,
+            output_dir: String::new(),
+            draw_ui: Arc::new(Mutex::new(None)),
+            draw_open: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn main_harness() -> Harness<'static, WidgetApp> {
+        Harness::builder()
+            .with_size(eframe::egui::Vec2::new(420.0, 760.0))
+            .build_eframe(|_cc| test_app())
+    }
+
+    fn adv_harness() -> Harness<'static, AdvCfg> {
+        Harness::builder()
+            .with_size(eframe::egui::Vec2::new(420.0, 560.0))
+            .build_ui_state(
+                |ui: &mut eframe::egui::Ui, adv: &mut AdvCfg| show_advanced_panel(ui, adv),
+                AdvCfg::default(),
+            )
+    }
+
+    /// Pointer drag across frames (press, move, release each land on their
+    /// own frame so egui registers a drag, not a click).
+    fn drag<State>(h: &mut Harness<'_, State>, from: Pos2, to: Pos2) {
+        h.input_mut().events.push(Event::PointerMoved(from));
+        h.input_mut().events.push(Event::PointerButton {
+            pos: from,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::default(),
+        });
+        h.step();
+        h.input_mut().events.push(Event::PointerMoved(to));
+        h.step();
+        h.input_mut().events.push(Event::PointerButton {
+            pos: to,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::default(),
+        });
+        h.step();
+        h.run();
+    }
+
+    /// Drag a slider node to a horizontal fraction of its own rect
+    /// (0.0 = left edge, 1.0 = right edge). Sliders share their accesskit
+    /// label with a SpinButton twin, so the Slider role disambiguates.
+    fn drag_slider_to<State>(
+        h: &mut Harness<'_, State>,
+        label: &str,
+        frac: f32,
+    ) -> eframe::egui::Rect {
+        use eframe::egui::accesskit::Role;
+        let rect = h.get_by_role_and_label(Role::Slider, label).rect();
+        let y = rect.center().y;
+        drag(
+            h,
+            Pos2::new(rect.min.x + 2.0, y),
+            Pos2::new(rect.min.x + rect.width() * frac.clamp(0.0, 1.0), y),
+        );
+        rect
+    }
+
+    /// Open a combo box (queried by role + `from_label` label — the label
+    /// twin and the selected value itself are not clickable) and pick a
+    /// popup option.
+    fn combo_pick<State>(h: &mut Harness<'_, State>, combo: &str, option: &str) {
+        use eframe::egui::accesskit::Role;
+        h.get_by_role_and_label(Role::ComboBox, combo).click();
+        h.run();
+        h.get_by_label(option).click();
+        h.run();
+    }
+
+    // ------------------------------------------------------------ sanitize ---
+
+    #[test]
+    fn sanitize_clamps_every_slider_range() {
+        // Below range, inside range, above range for every numeric field.
+        let mut a = AdvCfg {
+            fps: 0,
+            bitrate_kbps: 0,
+            maxrate_kbps: 0,
+            qp: 0,
+            crf: 0,
+            ..Default::default()
+        };
+        a.sanitize();
+        assert_eq!(a.fps, 15);
+        assert_eq!(a.bitrate_kbps, 1000);
+        assert_eq!(a.maxrate_kbps, 1000);
+
+        let mut a = AdvCfg {
+            fps: 30,
+            bitrate_kbps: 8000,
+            maxrate_kbps: 12000,
+            qp: 23,
+            crf: 23,
+            ..Default::default()
+        };
+        a.sanitize();
+        assert_eq!(
+            (a.fps, a.bitrate_kbps, a.maxrate_kbps, a.qp, a.crf),
+            (30, 8000, 12000, 23, 23)
+        );
+
+        let mut a = AdvCfg {
+            fps: 999,
+            bitrate_kbps: 999_999,
+            maxrate_kbps: 999_999,
+            qp: 255,
+            crf: 255,
+            ..Default::default()
+        };
+        a.sanitize();
+        assert_eq!(a.fps, 120);
+        assert_eq!(a.bitrate_kbps, 50000);
+        assert_eq!(a.maxrate_kbps, 80000);
+        assert_eq!(a.qp, 51);
+        assert_eq!(a.crf, 51);
+    }
+
+    #[test]
+    fn sanitize_rejects_tiny_canvas() {
+        let mut a = AdvCfg {
+            canvas: Some((10, 10)),
+            ..Default::default()
+        };
+        a.sanitize();
+        assert_eq!(a.canvas, None);
+        let mut a = AdvCfg {
+            canvas: Some((1280, 720)),
+            ..Default::default()
+        };
+        a.sanitize();
+        assert_eq!(a.canvas, Some((1280, 720)));
+    }
+
+    // ------------------------------------------------------------ dropdowns ---
+
+    #[test]
+    fn dropdown_options_cover_everything() {
+        assert_eq!(RateSel::all().len(), 4);
+        assert_eq!(EncoderSel::all().len(), 7);
+        assert_eq!(CANVAS_OPTIONS.len(), 3);
+        assert_eq!(CANVAS_OPTIONS[0], None);
+        let mut labels: Vec<_> = RateSel::all().iter().map(|r| r.label()).collect();
+        labels.extend(EncoderSel::all().iter().map(|e| e.label()));
+        assert!(labels.iter().all(|l| !l.is_empty()));
+        assert_eq!(
+            labels.len(),
+            labels
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        );
+    }
+
+    #[test]
+    fn encoder_ffmpeg_split_matches_paths() {
+        for e in [EncoderSel::Auto, EncoderSel::H264, EncoderSel::Hevc] {
+            assert!(!e.is_ffmpeg(), "{e:?} must stay native");
+        }
+        for e in [
+            EncoderSel::Nvenc,
+            EncoderSel::Amf,
+            EncoderSel::Qsv,
+            EncoderSel::X264,
+        ] {
+            assert!(e.is_ffmpeg(), "{e:?} must use ffmpeg");
+        }
+    }
+
+    #[test]
+    fn rate_mapping_covers_every_mode() {
+        let adv = |rc| AdvCfg {
+            rc,
+            ..Default::default()
+        };
+        assert!(matches!(
+            rate_from_adv(&adv(RateSel::Cbr)).unwrap(),
+            qcapture_core::RateControl::Cbr { .. }
+        ));
+        assert!(matches!(
+            rate_from_adv(&adv(RateSel::Vbr)).unwrap(),
+            qcapture_core::RateControl::Vbr { .. }
+        ));
+        assert!(matches!(
+            rate_from_adv(&adv(RateSel::Cqp)).unwrap(),
+            qcapture_core::RateControl::Cqp { .. }
+        ));
+        assert!(matches!(
+            rate_from_adv(&adv(RateSel::Crf)).unwrap(),
+            qcapture_core::RateControl::Crf { .. }
+        ));
+    }
+
+    // ------------------------------------------------------------ main screen ---
+
+    #[test]
+    fn target_labels_switch_modes() {
+        let mut h = main_harness();
+        h.get_by_label("Window").click();
+        h.run();
+        assert!(matches!(h.state().target, TargetSel::Window(_)));
+
+        h.get_by_label("Region").click();
+        h.run();
+        match &h.state().target {
+            TargetSel::Region { screen, rect } => {
+                assert_eq!(*screen, 0);
+                assert_eq!((rect.w, rect.h), (1920, 1080));
+            }
+            other => panic!("expected Region, got {other:?}"),
+        }
+
+        h.get_by_label("Screen").click();
+        h.run();
+        assert!(matches!(h.state().target, TargetSel::Screen(0)));
+    }
+
+    #[test]
+    fn quick_toggles_flip() {
+        let mut h = main_harness();
+        // Cursor fx row is Windows-only (no portable cursor position API).
+        #[cfg(windows)]
+        let labels = ["✏ Draw live", "highlight", "clicks", "system"];
+        #[cfg(not(windows))]
+        let labels = ["✏ Draw live", "system"];
+        for label in labels {
+            h.get_by_label(label).click();
+            h.run();
+        }
+        let s = h.state();
+        assert!(s.draw_live && !s.audio_on);
+        #[cfg(windows)]
+        assert!(s.cursor_highlight && s.cursor_ripple);
+        // Clicking again flips back.
+        h.get_by_label("✏ Draw live").click();
+        h.run();
+        assert!(!h.state().draw_live);
+    }
+
+    #[test]
+    fn gain_sliders_drive_mixer() {
+        let mut h = main_harness();
+        let sys: Vec<_> = h
+            .get_all_by_role(eframe::egui::accesskit::Role::Slider)
+            .collect();
+        assert_eq!(sys.len(), 2, "Sys + Mic gain sliders");
+        let before = h.state().levels.gain_db(false);
+        let r0 = sys[0].rect();
+        drop(sys);
+        drag(
+            &mut h,
+            Pos2::new(r0.min.x + 2.0, r0.center().y),
+            Pos2::new(r0.max.x - 2.0, r0.center().y),
+        );
+        assert!(
+            h.state().levels.gain_db(false) > before,
+            "dragging Sys right raises gain"
+        );
+    }
+
+    #[test]
+    fn mic_combo_selects_and_folder_types() {
+        use eframe::egui::accesskit::Role;
+        let mut h = main_harness();
+        // Unlabelled combos in layout order: screen-pick, then mic-pick.
+        let combos: Vec<_> = h.get_all_by_role(Role::ComboBox).collect();
+        assert_eq!(combos.len(), 2);
+        combos[1].click();
+        drop(combos);
+        h.run();
+        h.get_by_label("Mic A").click();
+        h.run();
+        assert_eq!(h.state().mic_name.as_deref(), Some("Mic A"));
+
+        // Single text field on the Screen target = output folder.
+        let fields: Vec<_> = h
+            .get_all_by_role(eframe::egui::accesskit::Role::TextInput)
+            .collect();
+        assert_eq!(fields.len(), 1);
+        fields[0].focus();
+        fields[0].type_text("D:\\Vids");
+        drop(fields);
+        h.run();
+        assert_eq!(h.state().output_dir, "D:\\Vids");
+    }
+
+    #[test]
+    fn screen_combo_selects_second_monitor() {
+        use eframe::egui::accesskit::Role;
+        let mut h = main_harness();
+        let combos: Vec<_> = h.get_all_by_role(Role::ComboBox).collect();
+        assert_eq!(combos.len(), 2);
+        combos[0].click();
+        drop(combos);
+        h.run();
+        h.get_by_label_contains("TestB").click();
+        h.run();
+        assert!(matches!(h.state().target, TargetSel::Screen(1)));
+    }
+
+    #[test]
+    fn window_combo_selects_listed_window() {
+        use eframe::egui::accesskit::Role;
+        let mut h = main_harness();
+        h.get_by_label("Window").click();
+        h.run();
+        // Window target shows window-pick first, mic-pick second.
+        let combos: Vec<_> = h.get_all_by_role(Role::ComboBox).collect();
+        assert_eq!(combos.len(), 2);
+        combos[0].click();
+        drop(combos);
+        h.run();
+        h.get_by_label_contains("Notepad").click();
+        h.run();
+        match &h.state().target {
+            TargetSel::Window(t) => assert_eq!(t, "Notepad doc"),
+            other => panic!("expected Window, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn record_with_empty_window_title_is_loud() {
+        let mut h = main_harness();
+        h.get_by_label("Window").click();
+        h.run();
+        h.get_by_label("●  Record").click();
+        h.run();
+        assert!(h.state().rec.is_none());
+        assert!(h.state().last_msg.contains("pick a window first"));
+    }
+
+    // ------------------------------------------------------------ advanced ---
+
+    #[test]
+    fn advanced_fps_slider_hits_min_mid_max() {
+        let mut h = adv_harness();
+        drag_slider_to(&mut h, "fps", 1.0);
+        assert_eq!(h.state().fps, 120);
+        drag_slider_to(&mut h, "fps", 0.0);
+        assert_eq!(h.state().fps, 15);
+        drag_slider_to(&mut h, "fps", 0.5);
+        let mid = h.state().fps;
+        assert!(
+            (40..=95).contains(&mid),
+            "mid drag lands mid-range, got {mid}"
+        );
+    }
+
+    #[test]
+    fn advanced_bitrate_slider_hits_min_and_max() {
+        let mut h = adv_harness();
+        drag_slider_to(&mut h, "bitrate kbps (CBR/VBR target)", 1.0);
+        assert_eq!(h.state().bitrate_kbps, 50000);
+        drag_slider_to(&mut h, "bitrate kbps (CBR/VBR target)", 0.0);
+        assert_eq!(h.state().bitrate_kbps, 1000);
+    }
+
+    #[test]
+    fn advanced_mode_sliders_appear_per_rate_mode() {
+        let mut h = adv_harness();
+        // CBR shows neither conditional slider.
+        assert!(h.query_by_label("maxrate kbps").is_none());
+        assert!(h.query_by_label("QP (lower=better)").is_none());
+
+        combo_pick(&mut h, "Rate control", "VBR");
+        assert_eq!(h.state().rc, RateSel::Vbr);
+        drag_slider_to(&mut h, "maxrate kbps", 1.0);
+        assert_eq!(h.state().maxrate_kbps, 80000);
+        drag_slider_to(&mut h, "maxrate kbps", 0.0);
+        assert_eq!(h.state().maxrate_kbps, 1000);
+
+        combo_pick(&mut h, "Rate control", "CQP");
+        assert_eq!(h.state().rc, RateSel::Cqp);
+        drag_slider_to(&mut h, "QP (lower=better)", 1.0);
+        assert_eq!(h.state().qp, 51);
+        drag_slider_to(&mut h, "QP (lower=better)", 0.0);
+        assert_eq!(h.state().qp, 0);
+
+        combo_pick(&mut h, "Rate control", "CRF");
+        assert_eq!(h.state().rc, RateSel::Crf);
+        drag_slider_to(&mut h, "CRF (lower=better)", 0.5);
+        let mid = h.state().crf;
+        assert!(
+            (10..=45).contains(&mid),
+            "mid CRF drag lands mid-range, got {mid}"
+        );
+    }
+
+    #[test]
+    fn advanced_encoder_dropdown_covers_all_options() {
+        let mut h = adv_harness();
+        for (label, sel) in [
+            ("NVENC (ffmpeg)", EncoderSel::Nvenc),
+            ("AMF (ffmpeg)", EncoderSel::Amf),
+            ("QSV (ffmpeg)", EncoderSel::Qsv),
+            ("x264 (ffmpeg)", EncoderSel::X264),
+            ("HEVC", EncoderSel::Hevc),
+            ("H264", EncoderSel::H264),
+            ("Auto (H264)", EncoderSel::Auto),
+        ] {
+            combo_pick(&mut h, "Encoder", label);
+            assert_eq!(h.state().encoder, sel);
+        }
+    }
+
+    #[test]
+    fn advanced_canvas_dropdown_covers_all_options() {
+        let mut h = adv_harness();
+        combo_pick(&mut h, "Canvas", "1280x720");
+        assert_eq!(h.state().canvas, Some((1280, 720)));
+        combo_pick(&mut h, "Canvas", "1920x1080");
+        assert_eq!(h.state().canvas, Some((1920, 1080)));
+        combo_pick(&mut h, "Canvas", "Native");
+        assert_eq!(h.state().canvas, None);
+    }
+
+    #[test]
+    fn advanced_rate_dropdown_covers_all_options() {
+        let mut h = adv_harness();
+        for (label, sel) in [
+            ("VBR", RateSel::Vbr),
+            ("CQP", RateSel::Cqp),
+            ("CRF", RateSel::Crf),
+            ("CBR", RateSel::Cbr),
+        ] {
+            combo_pick(&mut h, "Rate control", label);
+            assert_eq!(h.state().rc, sel);
+        }
+    }
+
+    #[test]
+    fn advanced_cursor_checkbox_toggles() {
+        let mut h = adv_harness();
+        assert!(h.state().show_cursor);
+        h.get_by_label("Capture cursor").click();
+        h.run();
+        assert!(!h.state().show_cursor);
+    }
+
+    // ------------------------------------------------------------ pure helpers ---
+
+    #[test]
+    fn region_string_parses_and_rejects() {
+        let r = parse_region_str("10,20,640,480").unwrap();
+        assert_eq!((r.x, r.y, r.w, r.h), (10, 20, 640, 480));
+        assert!(parse_region_str("10,20,0,480").is_none());
+        assert!(parse_region_str("nope").is_none());
+    }
+
+    #[test]
+    fn output_path_resolves_folder_or_cwd() {
+        let cwd = default_output_in("").unwrap();
+        assert!(cwd.starts_with("qcapture_") && cwd.ends_with(".mp4"));
+        assert!(!cwd.contains(std::path::MAIN_SEPARATOR));
+
+        let dir = std::env::temp_dir().join("qcapture-out-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = default_output_in(dir.to_str().unwrap()).unwrap();
+        assert!(out.starts_with(dir.to_str().unwrap()));
+        assert!(dir.is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

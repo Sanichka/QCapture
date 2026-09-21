@@ -10,6 +10,5 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 flume = "0.11"
-# Windows named-pipe audio input for ffmpeg (no second stdin exists).
-[target.'cfg(windows)'.dependencies]
+# Second ffmpeg stdin for mixed PCM: Windows named pipes, Unix sockets.
 interprocess = "2"

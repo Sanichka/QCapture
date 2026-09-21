@@ -1,7 +1,8 @@
-//! Phase 5b: ffmpeg audio input via Windows named pipe.
+//! Phase 5b: ffmpeg audio input via OS pipe (Windows named pipe, Unix socket).
 //!
 //! A process has a single stdin (already the video rawvideo pipe), so mixed
-//! PCM reaches ffmpeg through `\\.\pipe\qcapture-audio-<pid>-<n>`. The writer
+//! PCM reaches ffmpeg through a second input: `\\.\pipe\qcapture-audio-<pid>-<n>`
+//! on Windows, `unix:/tmp/qcapture-audio-<pid>-<n>.sock` elsewhere. The writer
 //! thread accepts one client (ffmpeg), streams i16 stereo 48 kHz chunks, and
 //! closes on channel disconnect — that EOF lets ffmpeg finalize its trailer.
 //!
@@ -18,6 +19,7 @@ use super::EncodeError;
 static PIPE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub struct FfmpegAudioPipe {
+    /// Value for ffmpeg `-i` (pipe name on Windows, `unix:/path` elsewhere).
     pub name: String,
     tx: flume::Sender<Vec<u8>>,
     handle: Option<JoinHandle<Result<u64, String>>>,
@@ -26,12 +28,26 @@ pub struct FfmpegAudioPipe {
 impl FfmpegAudioPipe {
     pub fn create() -> Result<Self, EncodeError> {
         let n = PIPE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let name = format!(r"\\.\pipe\qcapture-audio-{}-{n}", std::process::id());
+        #[cfg(windows)]
+        let (name, listen) = {
+            let name = format!(r"\\.\pipe\qcapture-audio-{}-{n}", std::process::id());
+            (name.clone(), name)
+        };
+        // Unix socket file in temp; stale files from crashed runs unlinked.
+        #[cfg(unix)]
+        let (name, listen) = {
+            let path = std::env::temp_dir()
+                .join(format!("qcapture-audio-{}-{n}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            (
+                format!("unix:{}", path.to_string_lossy()),
+                path.to_string_lossy().into_owned(),
+            )
+        };
         let (tx, rx) = flume::bounded::<Vec<u8>>(120);
-        let thread_name = name.clone();
         let handle = std::thread::Builder::new()
             .name("qcapture-audio-pipe".into())
-            .spawn(move || pipe_main(&thread_name, rx))
+            .spawn(move || pipe_main(&listen, rx))
             .map_err(|e| EncodeError::Probe(format!("audio pipe thread: {e}")))?;
         Ok(Self {
             name,
@@ -58,14 +74,7 @@ impl FfmpegAudioPipe {
 }
 
 fn pipe_main(name: &str, rx: flume::Receiver<Vec<u8>>) -> Result<u64, String> {
-    use interprocess::os::windows::named_pipe::*;
-    let listener = PipeListenerOptions::new()
-        .path(name)
-        .create_send_only::<pipe_mode::Bytes>()
-        .map_err(|e| format!("pipe listen {name}: {e}"))?;
-    // Blocks until ffmpeg opens the pipe. If ffmpeg never starts (bad args),
-    // the caller must NOT join this thread — see `finish`.
-    let mut stream = listener.accept().map_err(|e| format!("pipe accept: {e}"))?;
+    let mut stream = accept_one(name)?;
     let mut bytes = 0u64;
     for chunk in rx {
         // A failed write means ffmpeg went away: either it died mid-record
@@ -79,11 +88,50 @@ fn pipe_main(name: &str, rx: flume::Receiver<Vec<u8>>) -> Result<u64, String> {
     }
     let _ = stream.flush();
     drop(stream); // EOF -> ffmpeg finalizes audio
+    #[cfg(unix)]
+    let _ = std::fs::remove_file(name); // don't litter temp with sockets
     Ok(bytes)
+}
+
+/// Accept the single ffmpeg client. Blocks until ffmpeg connects; if ffmpeg
+/// never starts (bad args), the caller must NOT join this thread — see
+/// `finish`.
+#[cfg(windows)]
+fn accept_one(
+    name: &str,
+) -> Result<
+    interprocess::os::windows::named_pipe::PipeStream<
+        interprocess::os::windows::named_pipe::pipe_mode::None,
+        interprocess::os::windows::named_pipe::pipe_mode::Bytes,
+    >,
+    String,
+> {
+    use interprocess::os::windows::named_pipe::*;
+    let listener = PipeListenerOptions::new()
+        .path(name)
+        .create_send_only::<pipe_mode::Bytes>()
+        .map_err(|e| format!("pipe listen {name}: {e}"))?;
+    listener.accept().map_err(|e| format!("pipe accept: {e}"))
+}
+
+#[cfg(unix)]
+fn accept_one(path: &str) -> Result<interprocess::local_socket::Stream, String> {
+    use interprocess::local_socket::{
+        traits::Listener, GenericFilePath, ListenerOptions, ToFsName,
+    };
+    let fs_name = path
+        .to_fs_name::<GenericFilePath>()
+        .map_err(|e| format!("socket name {path}: {e}"))?;
+    let listener = ListenerOptions::new()
+        .name(fs_name)
+        .create_sync()
+        .map_err(|e| format!("socket listen {path}: {e}"))?;
+    listener.accept().map_err(|e| format!("socket accept: {e}"))
 }
 
 /// Forward mixed i16 chunks into the pipe sender. Ends when either side
 /// disconnects; fire-and-forget (no join — both ends are finite).
+/// Transport-agnostic: same for named pipes and Unix sockets.
 pub fn forward_to_pipe(
     mixed: flume::Receiver<Vec<u8>>,
     dest: flume::Sender<Vec<u8>>,

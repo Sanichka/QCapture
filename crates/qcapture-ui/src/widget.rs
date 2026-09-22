@@ -905,7 +905,7 @@ fn record_thread_body(
     #[cfg(not(windows))]
     {
         let _ = (&mic_name, &audio_on, &levels);
-        return Err("internal: native encoder off Windows".to_string());
+        Err("internal: native encoder off Windows".to_string())
     }
 
     #[cfg(windows)]

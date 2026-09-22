@@ -3147,6 +3147,7 @@ dependencies = [
  "qcapture-core",
  "qcapture-encode",
  "qcapture-ui",
+ "rfd",
  "serde_json",
  "tracing",
  "tracing-subscriber",

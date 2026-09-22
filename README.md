@@ -100,6 +100,8 @@ cargo build --release -p qcapture-cli
 
 # Floating control widget (all functions live here)
 .\target\release\qcapture.exe widget
+# ...or the console-less launcher (logs to %APPDATA%\QCapture\logs)
+.\target\release\qcapture-widget.exe
 ```
 
 Native encoders auto-switch to ffmpeg when annotations, drawing, or cursor fx

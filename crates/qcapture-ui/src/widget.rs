@@ -368,8 +368,8 @@ pub fn run() -> Result<(), String> {
 
     let viewport = egui::ViewportBuilder::default()
         .with_title("QCapture")
-        .with_inner_size([360.0, 470.0])
-        .with_min_inner_size([320.0, 400.0])
+        .with_inner_size([430.0, 480.0])
+        .with_min_inner_size([360.0, 420.0])
         .with_always_on_top()
         .with_active(true);
 
@@ -1778,7 +1778,7 @@ impl eframe::App for WidgetApp {
                     }
                 });
                 if ui
-                    .add_sized([340.0, 36.0], egui::Button::new("●  Record"))
+                    .add_sized([390.0, 36.0], egui::Button::new("●  Record"))
                     .clicked()
                 {
                     // Validate window target early for a loud error instead of a
@@ -1795,7 +1795,7 @@ impl eframe::App for WidgetApp {
                     }
                 }
             } else if ui
-                .add_sized([340.0, 36.0], egui::Button::new("■  Stop"))
+                .add_sized([390.0, 36.0], egui::Button::new("■  Stop"))
                 .clicked()
             {
                 self.stop_recording();

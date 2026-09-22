@@ -287,7 +287,7 @@ fn main() -> anyhow::Result<()> {
         return query_presets(cli.json);
     }
 
-    println!("QCapture 0.1.0 — Phase 1 (video record).");
+    println!("QCapture {} — screen recorder.", env!("CARGO_PKG_VERSION"));
     println!("Try: qcapture --list-screens | qcapture record --help");
     Ok(())
 }

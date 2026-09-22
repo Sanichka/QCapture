@@ -14,7 +14,15 @@
 //! flume — the pump burns them; undo/clear mirror locally for counts.
 
 use eframe::egui;
-use qcapture_annotate::{AnnotateDoc, Rgba, Stroke, Tool};
+use qcapture_annotate::{smooth_polyline, AnnotateDoc, Rgba, Stroke, Tool};
+
+/// Live-stream throttle: resend the smoothed-so-far pen when 6+ new raw
+/// points arrived or 80 ms elapsed — whichever first. Full-state resends
+/// heal dropped events; the pump replaces (never accumulates).
+const LIVE_MIN_POINTS: usize = 6;
+const LIVE_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_millis(80);
+/// Chaikin iterations for pen input (endpoint-preserving).
+const SMOOTH_ITERS: usize = 2;
 
 pub struct DrawPanel {
     tool: DrawTool,
@@ -23,6 +31,8 @@ pub struct DrawPanel {
     font_size: f32,
     strokes: Vec<Stroke>,
     active_pen: Vec<egui::Pos2>,
+    pen_sent: usize,
+    pen_last_send: std::time::Instant,
     shape_anchor: Option<egui::Pos2>,
     shape_current: egui::Pos2,
     text_at: Option<egui::Pos2>,
@@ -91,6 +101,8 @@ impl DrawPanel {
             font_size: 40.0,
             strokes: Vec::new(),
             active_pen: Vec::new(),
+            pen_sent: 0,
+            pen_last_send: std::time::Instant::now(),
             shape_anchor: None,
             shape_current: egui::Pos2::ZERO,
             text_at: None,
@@ -215,7 +227,11 @@ impl DrawPanel {
         text: Option<String>,
         width_px: f32,
     ) {
-        if points.len() < 2 && tool != Tool::Text {
+        if points.is_empty() {
+            return;
+        }
+        // Single-point pen (click without drag) is a dot; shapes need a span.
+        if points.len() < 2 && !matches!(tool, Tool::Text | Tool::Pen) {
             return;
         }
         // Feed-pixel sizes: points live in feed space (draw rect maps 1:1
@@ -305,10 +321,15 @@ impl DrawPanel {
                 ui.horizontal(|ui| {
                     if ui.button("Undo").clicked() {
                         self.strokes.pop();
+                        // Cancel any in-progress gesture so panel and pump agree.
+                        self.active_pen.clear();
+                        self.shape_anchor = None;
                         let _ = self.events.try_send(DrawEvent::Undo);
                     }
                     if ui.button("Clear").clicked() {
                         self.strokes.clear();
+                        self.active_pen.clear();
+                        self.shape_anchor = None;
                         let _ = self.events.try_send(DrawEvent::Clear);
                     }
                     ui.label(format!(
@@ -376,17 +397,21 @@ impl DrawPanel {
             } else if self.tool == DrawTool::Pen {
                 if pointer.primary_pressed() && !over_chrome(p) && draw.contains(p) {
                     self.active_pen = vec![p];
+                    self.pen_sent = 0;
+                    self.pen_last_send = std::time::Instant::now();
                 } else if pointer.primary_down()
                     && !self.active_pen.is_empty()
                     && (*self.active_pen.last().unwrap() - p).length() >= 2.0
                 {
                     self.active_pen.push(p);
+                    self.maybe_send_live(draw, k);
                 }
                 if pointer.primary_released() && !self.active_pen.is_empty() {
-                    let pts: Vec<(f32, f32)> = std::mem::take(&mut self.active_pen)
-                        .iter()
-                        .filter_map(|q| self.to_norm(*q, draw))
-                        .collect();
+                    // Commit the same smoothed path that was streamed live,
+                    // so release causes no visual pop. AddStroke also clears
+                    // the pump's live preview.
+                    let pts = self.smooth_active_norm(draw);
+                    self.active_pen.clear();
                     let w = self.width * k;
                     self.push_stroke(pts, Tool::Pen, None, w);
                 }
@@ -446,11 +471,18 @@ impl DrawPanel {
             egui::Stroke::new(1.0_f32, egui::Color32::WHITE),
             egui::StrokeKind::Outside,
         );
-        // In-progress rubber band.
-        let band = egui::Stroke::new(1.0_f32, egui::Color32::YELLOW);
+        // In-progress pen preview in true style (color + width), smoothed
+        // like the commit — what you see is what burns in.
         if self.active_pen.len() >= 2 {
-            painter.add(egui::Shape::line(self.active_pen.clone(), band));
+            painter.add(egui::Shape::line(
+                self.smooth_active(),
+                egui::Stroke::new(self.width, self.color),
+            ));
+        } else if self.active_pen.len() == 1 {
+            painter.circle_filled(self.active_pen[0], self.width / 2.0, self.color);
         }
+        // Transient shape guides stay yellow (commit replaces them).
+        let band = egui::Stroke::new(1.0_f32, egui::Color32::YELLOW);
         if let Some(a) = self.shape_anchor {
             let b = self.shape_current;
             match self.tool {
@@ -485,6 +517,54 @@ impl DrawPanel {
     fn push_stroke_text(&mut self, pt: (f32, f32), buf: String, font_px_logical: f32, k: f32) {
         // Scale logical font size to feed pixels so text matches the video 1:1.
         self.push_stroke(vec![pt], Tool::Text, Some(buf), font_px_logical * k);
+    }
+
+    /// Smoothed in-progress pen in draw space (endpoint-preserving Chaikin).
+    fn smooth_active(&self) -> Vec<egui::Pos2> {
+        smooth_polyline(
+            &self
+                .active_pen
+                .iter()
+                .map(|p| (p.x, p.y))
+                .collect::<Vec<_>>(),
+            SMOOTH_ITERS,
+        )
+        .into_iter()
+        .map(|(x, y)| egui::Pos2::new(x, y))
+        .collect()
+    }
+
+    /// Smoothed in-progress pen in feed-normalized coords (for send/commit).
+    fn smooth_active_norm(&self, draw: egui::Rect) -> Vec<(f32, f32)> {
+        self.smooth_active()
+            .iter()
+            .filter_map(|q| self.to_norm(*q, draw))
+            .collect()
+    }
+
+    /// Stream a live preview resend when the throttle trips (6+ new raw
+    /// points or 80 ms). Full smoothed-so-far state: dropped sends heal on
+    /// the next resend, and the pump replaces instead of accumulating.
+    fn maybe_send_live(&mut self, draw: egui::Rect, k: f32) {
+        if self.active_pen.len() < 2
+            || (self.active_pen.len() - self.pen_sent < LIVE_MIN_POINTS
+                && self.pen_last_send.elapsed() < LIVE_MAX_INTERVAL)
+        {
+            return;
+        }
+        let pts = self.smooth_active_norm(draw);
+        if pts.is_empty() {
+            return;
+        }
+        let c = self.color;
+        let w = (self.width * k).max(1.0);
+        let _ = self.events.try_send(DrawEvent::PenLive {
+            color: Rgba(c.r(), c.g(), c.b(), c.a()),
+            width_px: w,
+            points: pts,
+        });
+        self.pen_sent = self.active_pen.len();
+        self.pen_last_send = std::time::Instant::now();
     }
 
     /// Feed size accessors (preview resize updates these).
@@ -585,4 +665,120 @@ pub fn run_draw_window(
         },
         frames_shown: 0,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui::{CentralPanel, Event, PointerButton, Pos2, Vec2};
+    use egui_kittest::Harness;
+
+    /// 800x800 window, 640x480 feed: draw rect is 800x600 centered, so
+    /// x=400, y=100..700 maps to norm (0.5, 0.0..1.0). Well clear of the
+    /// top-left toolbar in every layout.
+    fn harness_with_panel() -> (Harness<'static, DrawPanel>, flume::Receiver<DrawEvent>) {
+        let (ev_tx, ev_rx) = flume::bounded::<DrawEvent>(256);
+        let h = Harness::builder()
+            .with_size(Vec2::new(800.0, 800.0))
+            .build_state(
+                |ctx: &egui::Context, panel: &mut DrawPanel| {
+                    CentralPanel::default().show(ctx, |ui| panel.show(ctx, ui));
+                },
+                DrawPanel::new(640, 480, ev_tx),
+            );
+        (h, ev_rx)
+    }
+
+    /// One input batch per frame (like real input): press, then each move,
+    /// then release. Batching everything into one frame collapses moves.
+    fn press(h: &mut Harness<'_, DrawPanel>, at: Pos2) {
+        h.input_mut().events.push(Event::PointerMoved(at));
+        h.input_mut().events.push(Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Default::default(),
+        });
+        h.step();
+    }
+
+    fn move_to(h: &mut Harness<'_, DrawPanel>, at: Pos2) {
+        h.input_mut().events.push(Event::PointerMoved(at));
+        h.step();
+    }
+
+    fn release(h: &mut Harness<'_, DrawPanel>, at: Pos2) {
+        h.input_mut().events.push(Event::PointerButton {
+            pos: at,
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        });
+        h.step();
+    }
+
+    fn drain(rx: &flume::Receiver<DrawEvent>) -> Vec<DrawEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[test]
+    fn drag_streams_live_then_commits() {
+        let (mut h, ev_rx) = harness_with_panel();
+        // Vertical drag, 10 moves of 30px: 11 raw points trip the throttle.
+        let from = Pos2::new(400.0, 250.0);
+        press(&mut h, from);
+        for i in 1..=10 {
+            move_to(&mut h, Pos2::new(400.0, 250.0 + i as f32 * 30.0));
+        }
+        let live: Vec<_> = drain(&ev_rx)
+            .into_iter()
+            .filter_map(|ev| match ev {
+                DrawEvent::PenLive { points, .. } => Some(points),
+                _ => None,
+            })
+            .collect();
+        assert!(!live.is_empty(), "drag must stream PenLive previews");
+        // Live stream starts at the drag origin (norm x=0.5, y=0.25).
+        let first = &live[0];
+        assert!((first[0].0 - 0.5).abs() < 0.02);
+        assert!((first[0].1 - 0.25).abs() < 0.02);
+
+        release(&mut h, Pos2::new(400.0, 550.0));
+        h.run();
+        let mut commits = 0;
+        for ev in drain(&ev_rx) {
+            if let DrawEvent::AddStroke(s) = ev {
+                commits += 1;
+                // Smoothing preserves endpoints: commit spans the drag.
+                assert!((s.points[0].0 - 0.5).abs() < 0.02);
+                assert!((s.points[0].1 - 0.25).abs() < 0.02);
+                let last = s.points.last().unwrap();
+                assert!((last.0 - 0.5).abs() < 0.02);
+                assert!((last.1 - 0.75).abs() < 0.02);
+            }
+        }
+        assert_eq!(commits, 1, "exactly one commit on release");
+        assert_eq!(h.state().stroke_count(), 1);
+    }
+
+    #[test]
+    fn click_without_drag_commits_dot() {
+        let (mut h, ev_rx) = harness_with_panel();
+        press(&mut h, Pos2::new(400.0, 400.0));
+        release(&mut h, Pos2::new(400.0, 400.0));
+        h.run();
+        let commits: Vec<_> = drain(&ev_rx)
+            .into_iter()
+            .filter_map(|ev| match ev {
+                DrawEvent::AddStroke(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].points.len(), 1, "click draws a dot");
+    }
 }

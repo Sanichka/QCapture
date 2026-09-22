@@ -59,6 +59,9 @@ impl BBox {
     }
 }
 
+/// A live preview older than this with no resend is dropped (lost commit).
+const LIVE_TIMEOUT_MS: u64 = 2000;
+
 /// Timed compositor: owns the overlay, applies strokes/watermarks up to a
 /// clock, and blends the dirty region onto video frames.
 pub struct Annotator {
@@ -74,6 +77,13 @@ pub struct Annotator {
     /// semantics) while video frames change underneath, so EVERY frame blends
     /// this region — the skip is only "overlay still empty".
     coverage: BBox,
+    /// In-progress pen stroke (`PenLive`): rasterized into a separate layer
+    /// so each resend replaces (never double-darkens), then committed into
+    /// the main layer by the matching `AddStroke`. Cleared by Undo/Clear
+    /// and by a staleness timeout (lost commit edge).
+    live_layer: Vec<u8>,
+    live_bb: BBox,
+    live_since_ms: Option<u64>,
     fonts: HashMap<String, Option<ab_glyph::FontArc>>,
     images: HashMap<String, Option<DecodedImage>>,
     warned_font: bool,
@@ -102,6 +112,9 @@ impl Annotator {
             h,
             layer: vec![0u8; (w as usize) * (h as usize) * 4],
             coverage: BBox::empty(),
+            live_layer: vec![0u8; (w as usize) * (h as usize) * 4],
+            live_bb: BBox::empty(),
+            live_since_ms: None,
             fonts: HashMap::new(),
             images: HashMap::new(),
             warned_font: false,
@@ -134,37 +147,53 @@ impl Annotator {
             self.coverage.union(dirty);
             self.wm_applied += 1;
         }
+        // Stale live preview (commit lost between resends): expire it so a
+        // ghost stroke can't linger. Normal streams refresh well inside this.
+        if let Some(since) = self.live_since_ms {
+            if now_ms.saturating_sub(since) > LIVE_TIMEOUT_MS {
+                self.clear_live();
+            }
+        }
     }
 
-    /// Blend the coverage region onto a top-down tight BGRA frame in place.
-    /// Returns blended pixel count (0 = overlay still empty, skipped).
-    pub fn blend_bgra(&mut self, frame: &mut [u8]) -> usize {
-        if self.coverage.is_empty() {
+    /// Blend one straight-RGBA layer region onto a top-down tight BGRA
+    /// frame in place. Returns blended pixel count.
+    fn blend_region(frame: &mut [u8], layer: &[u8], w: u32, h: u32, bb: BBox) -> usize {
+        if bb.is_empty() {
             return 0;
         }
-        let d = self.coverage.clamp(self.w, self.h);
+        let d = bb.clamp(w, h);
         if d.is_empty() {
             return 0;
         }
-        debug_assert_eq!(frame.len(), (self.w as usize) * (self.h as usize) * 4);
-        let w = self.w as usize;
+        debug_assert_eq!(frame.len(), (w as usize) * (h as usize) * 4);
+        let w = w as usize;
         let mut count = 0;
         for y in d.y0 as usize..d.y1 as usize {
             for x in d.x0 as usize..d.x1 as usize {
                 let li = (y * w + x) * 4;
-                let a = self.layer[li + 3] as f32 / 255.0;
+                let a = layer[li + 3] as f32 / 255.0;
                 if a <= 0.0 {
                     continue;
                 }
                 let fi = li;
                 let inv = 1.0 - a;
                 // Layer RGBA -> frame BGRA, src-over.
-                frame[fi] = (self.layer[li + 2] as f32 * a + frame[fi] as f32 * inv) as u8;
-                frame[fi + 1] = (self.layer[li + 1] as f32 * a + frame[fi + 1] as f32 * inv) as u8;
-                frame[fi + 2] = (self.layer[li] as f32 * a + frame[fi + 2] as f32 * inv) as u8;
+                frame[fi] = (layer[li + 2] as f32 * a + frame[fi] as f32 * inv) as u8;
+                frame[fi + 1] = (layer[li + 1] as f32 * a + frame[fi + 1] as f32 * inv) as u8;
+                frame[fi + 2] = (layer[li] as f32 * a + frame[fi + 2] as f32 * inv) as u8;
                 count += 1;
             }
         }
+        count
+    }
+
+    /// Blend the coverage region plus any open live stroke onto a top-down
+    /// tight BGRA frame in place. Returns blended pixel count (0 = overlay
+    /// still empty, skipped).
+    pub fn blend_bgra(&mut self, frame: &mut [u8]) -> usize {
+        let mut count = Self::blend_region(frame, &self.layer, self.w, self.h, self.coverage);
+        count += Self::blend_region(frame, &self.live_layer, self.w, self.h, self.live_bb);
         count
     }
 
@@ -173,10 +202,49 @@ impl Annotator {
         &self.layer
     }
 
+    /// Drop any open live stroke (commit lost, undo/clear, timeout).
+    fn clear_live(&mut self) {
+        self.live_layer.fill(0);
+        self.live_bb = BBox::empty();
+        self.live_since_ms = None;
+    }
+
+    /// Rasterize a pen stroke into the live layer, replacing the previous
+    /// live preview (resends carry full smoothed-so-far points, so replace
+    /// semantics keep coverage exact — never double-darkened).
+    fn raster_live(&mut self, color: &Rgba, width_px: f32, points: &[(f32, f32)], now_ms: u64) {
+        if points.is_empty() {
+            self.clear_live();
+            return;
+        }
+        let stroke = Stroke {
+            points: points.to_vec(),
+            color: color.clone(),
+            width_px: width_px.max(1.0),
+            tool: Tool::Pen,
+            text: None,
+            appear_ms: now_ms,
+            font_px: None,
+            filled: false,
+            font_path: None,
+        };
+        // raster_stroke writes into self.layer: swap the buffers, rasterize,
+        // swap back. Main layer untouched, no full rebuild per resend.
+        self.live_layer.fill(0);
+        std::mem::swap(&mut self.layer, &mut self.live_layer);
+        let bb = self.raster_stroke(&stroke);
+        std::mem::swap(&mut self.layer, &mut self.live_layer);
+        self.live_bb = bb;
+        self.live_since_ms = Some(now_ms);
+    }
+
     /// Apply one live-drawing event at clock `now_ms`.
     pub fn apply_event(&mut self, ev: &DrawEvent, now_ms: u64) {
         match ev {
             DrawEvent::AddStroke(s) => {
+                // A pen commit always follows its live stream: drop the
+                // preview first so the committed raster doesn't double up.
+                self.clear_live();
                 let mut s = s.clone();
                 s.appear_ms = now_ms;
                 self.doc.strokes.push(s);
@@ -192,11 +260,20 @@ impl Annotator {
                 let bb = self.raster_stroke(&self.doc.strokes[idx].clone());
                 self.coverage.union(bb);
             }
+            DrawEvent::PenLive {
+                color,
+                width_px,
+                points,
+            } => {
+                self.raster_live(color, *width_px, points, now_ms);
+            }
             DrawEvent::Undo => {
+                self.clear_live();
                 self.doc.strokes.pop();
                 self.rebuild();
             }
             DrawEvent::Clear => {
+                self.clear_live();
                 self.doc.strokes.clear();
                 self.doc.watermarks.clear();
                 self.rebuild();
@@ -209,6 +286,7 @@ impl Annotator {
     pub fn rebuild(&mut self) {
         self.layer.fill(0);
         self.coverage = BBox::empty();
+        self.clear_live();
         self.stroke_order = (0..self.doc.strokes.len()).collect();
         self.stroke_order
             .sort_by_key(|&i| self.doc.strokes[i].appear_ms);
@@ -773,5 +851,101 @@ mod tests {
         // Scripted line pixel (y=50, x=20) still red.
         let i = (50 * 100 + 20) * 4;
         assert_eq!(frame[i + 2], 255);
+    }
+
+    fn live_pen(color: (u8, u8, u8), points: Vec<(f32, f32)>) -> super::DrawEvent {
+        super::DrawEvent::PenLive {
+            color: Rgba(color.0, color.1, color.2, 255),
+            width_px: 6.0,
+            points,
+        }
+    }
+
+    #[test]
+    fn pen_live_shows_before_commit() {
+        let mut ann = Annotator::new(AnnotateDoc::default(), 100, 100);
+        // Partial stream previews immediately, without any commit.
+        ann.apply_event(&live_pen((255, 0, 0), vec![(0.2, 0.5), (0.4, 0.5)]), 1000);
+        let mut frame = vec![0u8; 100 * 100 * 4];
+        let n = ann.blend_bgra(&mut frame);
+        assert!(n > 10, "live preview should blend pixels, got {n}");
+        assert_eq!(ann.doc.strokes.len(), 0, "nothing committed yet");
+    }
+
+    #[test]
+    fn pen_live_resend_replaces_without_doubling() {
+        let mut ann = Annotator::new(AnnotateDoc::default(), 100, 100);
+        let pts: Vec<(f32, f32)> = vec![(0.2, 0.5), (0.4, 0.5)];
+        ann.apply_event(&live_pen((255, 0, 0), pts.clone()), 1000);
+        let mut f1 = vec![0u8; 100 * 100 * 4];
+        ann.blend_bgra(&mut f1);
+        // Same points resent (throttle overlap): identical pixels, no buildup.
+        ann.apply_event(&live_pen((255, 0, 0), pts), 1100);
+        let mut f2 = vec![0u8; 100 * 100 * 4];
+        ann.blend_bgra(&mut f2);
+        assert_eq!(f1, f2, "resend must replace, not accumulate");
+    }
+
+    #[test]
+    fn pen_commit_clears_live_without_doubling() {
+        use super::DrawEvent;
+        let mut ann = Annotator::new(AnnotateDoc::default(), 100, 100);
+        let pts = vec![(0.2, 0.5), (0.4, 0.5), (0.6, 0.5)];
+        ann.apply_event(&live_pen((255, 0, 0), pts.clone()), 1000);
+        // Commit the same stroke: live preview drops, committed raster lands.
+        ann.apply_event(
+            &DrawEvent::AddStroke(Stroke {
+                points: pts,
+                color: Rgba(255, 0, 0, 255),
+                width_px: 6.0,
+                tool: Tool::Pen,
+                text: None,
+                appear_ms: 0,
+                font_px: None,
+                filled: false,
+                font_path: None,
+            }),
+            1200,
+        );
+        assert_eq!(ann.doc.strokes.len(), 1);
+        let mut frame = vec![0u8; 100 * 100 * 4];
+        let n = ann.blend_bgra(&mut frame);
+        assert!(n > 10);
+        // Reference: same stroke committed with no live phase at all.
+        let mut ann2 = Annotator::new(AnnotateDoc::default(), 100, 100);
+        ann2.apply_event(
+            &DrawEvent::AddStroke(Stroke {
+                points: vec![(0.2, 0.5), (0.4, 0.5), (0.6, 0.5)],
+                color: Rgba(255, 0, 0, 255),
+                width_px: 6.0,
+                tool: Tool::Pen,
+                text: None,
+                appear_ms: 0,
+                font_px: None,
+                filled: false,
+                font_path: None,
+            }),
+            1200,
+        );
+        let mut frame2 = vec![0u8; 100 * 100 * 4];
+        ann2.blend_bgra(&mut frame2);
+        assert_eq!(frame, frame2, "commit after live == clean commit");
+    }
+
+    #[test]
+    fn pen_live_cancelled_by_undo_and_timeout() {
+        use super::DrawEvent;
+        let mut ann = Annotator::new(AnnotateDoc::default(), 100, 100);
+        ann.apply_event(&live_pen((255, 0, 0), vec![(0.2, 0.5), (0.4, 0.5)]), 1000);
+        // Undo cancels the open stroke.
+        ann.apply_event(&DrawEvent::Undo, 1100);
+        let mut frame = vec![0u8; 100 * 100 * 4];
+        assert_eq!(ann.blend_bgra(&mut frame), 0);
+
+        // Stale preview (lost commit) expires via the pump clock.
+        ann.apply_event(&live_pen((255, 0, 0), vec![(0.2, 0.5), (0.4, 0.5)]), 2000);
+        ann.apply_until(2000 + 2001);
+        let mut frame2 = vec![0u8; 100 * 100 * 4];
+        assert_eq!(ann.blend_bgra(&mut frame2), 0, "stale live must expire");
     }
 }

@@ -203,9 +203,19 @@ impl EditorApp {
     }
 
     fn push_stroke(&mut self, points: Vec<(f32, f32)>, tool: Tool, text: Option<String>, ppp: f32) {
-        if points.len() < 2 && tool != Tool::Text {
+        if points.is_empty() {
             return;
         }
+        // Single-point pen (click without drag) is a dot; shapes need a span.
+        if points.len() < 2 && !matches!(tool, Tool::Text | Tool::Pen) {
+            return;
+        }
+        // Endpoint-preserving Chaikin, like the live draw panel.
+        let points = if tool == Tool::Pen {
+            qcapture_annotate::smooth_polyline(&points, 2)
+        } else {
+            points
+        };
         let c = self.color;
         self.strokes.push(Stroke {
             points,
@@ -457,10 +467,14 @@ impl EditorApp {
                             && ui.input(|i| i.key_pressed(egui::Key::Z)))
                     {
                         self.strokes.pop();
+                        self.active_pen.clear();
+                        self.shape_anchor = None;
                         self.preview_rev += 1;
                     }
                     if ui.button("Clear").clicked() {
                         self.strokes.clear();
+                        self.active_pen.clear();
+                        self.shape_anchor = None;
                         self.preview_rev += 1;
                     }
                     ui.label(format!("{} strokes", self.strokes.len()));
@@ -597,11 +611,28 @@ impl EditorApp {
             egui::Stroke::new(1.5_f32, egui::Color32::WHITE),
             egui::StrokeKind::Outside,
         );
-        // Rubber band / in-progress pen.
-        let band = egui::Stroke::new(1.0_f32, egui::Color32::YELLOW);
+        // In-progress pen preview in true style (smoothed like the commit).
         if self.active_pen.len() >= 2 {
-            painter.add(egui::Shape::line(self.active_pen.clone(), band));
+            let smooth: Vec<egui::Pos2> = qcapture_annotate::smooth_polyline(
+                &self
+                    .active_pen
+                    .iter()
+                    .map(|p| (p.x, p.y))
+                    .collect::<Vec<_>>(),
+                2,
+            )
+            .into_iter()
+            .map(|(x, y)| egui::Pos2::new(x, y))
+            .collect();
+            painter.add(egui::Shape::line(
+                smooth,
+                egui::Stroke::new(self.width, self.color),
+            ));
+        } else if self.active_pen.len() == 1 {
+            painter.circle_filled(self.active_pen[0], self.width / 2.0, self.color);
         }
+        // Transient shape guides stay yellow (commit replaces them).
+        let band = egui::Stroke::new(1.0_f32, egui::Color32::YELLOW);
         if let Some(a) = self.shape_anchor {
             let b = self.shape_current;
             match self.tool {

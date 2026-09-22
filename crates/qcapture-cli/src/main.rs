@@ -1425,7 +1425,7 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
                 stop,
             );
         }
-        return run_ffmpeg_record(
+        run_ffmpeg_record(
             &args,
             kind,
             rate,
@@ -1434,7 +1434,7 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
             show_cursor,
             duration,
             stop,
-        );
+        )
     }
 
     // Phase 3 audio: system loopback on by default, mic opt-in. Fail-soft —

@@ -1008,16 +1008,14 @@ fn record_thread_body(
     pause: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) -> Result<String, String> {
-    // Staged annotations, live drawing AND cursor fx need the ffmpeg byte
-    // path. Auto-switch a native encoder rather than failing: NVENC
-    // availability is probed inside the ffmpeg branch.
+    // Live drawing AND cursor fx need the ffmpeg byte path. Auto-switch a
+    // native encoder rather than failing: NVENC availability is probed
+    // inside the ffmpeg branch. Timed annotations burn into MF directly.
     let mut adv_owned = adv.clone();
     let mut switched_note = String::new();
-    if (annotate.is_some() || draw_caps.is_some() || cursor_fx.is_some())
-        && !adv_owned.encoder.is_ffmpeg()
-    {
+    if (draw_caps.is_some() || cursor_fx.is_some()) && !adv_owned.encoder.is_ffmpeg() {
         adv_owned.encoder = EncoderSel::Nvenc;
-        switched_note = " (auto-switched to NVENC for annotations/drawing/cursor-fx)".to_string();
+        switched_note = " (auto-switched to NVENC for drawing/cursor-fx)".to_string();
     }
     // MF is CBR-only; a staged non-CBR mode with an MF encoder is a loud error
     // (no silent fallback to a different quality contract).
@@ -1058,10 +1056,9 @@ fn record_thread_body(
         )
         .map(|m| format!("{m}{switched_note}"));
     }
-    if annotate.is_some() || draw_caps.is_some() || cursor_fx.is_some() {
+    if draw_caps.is_some() || cursor_fx.is_some() {
         return Err(
-            "annotations / live drawing / cursor-fx need an ffmpeg encoder (NVENC/AMF/QSV/x264)"
-                .to_string(),
+            "live drawing / cursor-fx need an ffmpeg encoder (NVENC/AMF/QSV/x264)".to_string(),
         );
     }
 
@@ -1115,6 +1112,7 @@ fn record_thread_body(
                     None,
                     stop,
                     pause.clone(),
+                    annotate.clone(),
                 )
             }
             TargetSel::Window(title) => rec::record_window_title(
@@ -1127,6 +1125,7 @@ fn record_thread_body(
                 None,
                 stop,
                 pause.clone(),
+                annotate.clone(),
             ),
             TargetSel::Region { screen, rect } => {
                 let idx = qcapture_capture::wgc_monitor_index(*screen);
@@ -1144,6 +1143,7 @@ fn record_thread_body(
                     None,
                     stop,
                     pause.clone(),
+                    annotate.clone(),
                 )
             }
         };
@@ -1957,7 +1957,7 @@ impl eframe::App for WidgetApp {
             }
             if self.pending_doc.is_some() && self.rec.is_none() {
                 ui.label(format!(
-                    "staged annotations ({} strokes) — burns in on next record (ffmpeg encoder)",
+                    "staged annotations ({} strokes) — burns in on next record",
                     self.pending_doc
                         .as_ref()
                         .map(|d| d.strokes.len())

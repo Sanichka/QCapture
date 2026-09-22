@@ -106,8 +106,10 @@ cargo build --release -p qcapture-cli
 .\target\release\qcapture-widget.exe
 ```
 
-Native encoders auto-switch to ffmpeg when annotations, drawing, or cursor fx
-are requested (they need CPU pixels); the switch is logged.
+Timed annotations (`--annotate`) burn into native encoders too (at native
+size; combine with `--canvas` only via an ffmpeg encoder). Live drawing
+and cursor fx still need CPU pixels, so native encoders auto-switch to
+ffmpeg when those are requested; the switch is logged.
 
 ## CLI reference
 

@@ -192,7 +192,8 @@ struct RecordArgs {
     mic_mute: bool,
 
     /// Burn timed annotations from a .qcap.json doc (see `annotate-demo`).
-    /// Native encoders auto-switch to ffmpeg for burn-in.
+    /// Works on native encoders too (at native size; scaled burn-in needs
+    /// --encoder nvenc|amf|qsv|x264).
     #[arg(long)]
     annotate: Option<String>,
 
@@ -1515,18 +1516,18 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
     // availability is probed inside the ffmpeg branch).
     #[cfg(windows)]
     {
+        // Live drawing and cursor fx need the ffmpeg byte path (no CPU
+        // pixels on the native path). Timed annotations burn into MF
+        // directly, so they no longer force a switch.
         if matches!(path, PathSel::Mf { .. })
-            && (args.annotate.is_some()
-                || args.draw
+            && (args.draw
                 || args.draw_test.is_some()
                 || args.cursor_highlight
                 || args.cursor_ripple)
         {
             let info = qcapture_encode::probe_ffmpeg().map_err(|e| anyhow::anyhow!("{e}"))?;
             let kind = qcapture_encode::resolve_auto_encoder(&info);
-            eprintln!(
-                "auto-switched to {kind:?} for annotations/drawing/cursor-fx (MF is video-only)"
-            );
+            eprintln!("auto-switched to {kind:?} for drawing/cursor-fx (MF is video-only)");
             path = PathSel::Ffmpeg(kind);
         }
     }
@@ -1669,6 +1670,20 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
             );
         }
         let use_hevc = matches!(path, PathSel::Mf { hevc: true });
+        // Load annotations early: bad JSON must fail before a minute of capture.
+        let annotate = match &args.annotate {
+            Some(path) => {
+                let doc = qcapture_annotate::AnnotateDoc::load(path)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                eprintln!(
+                    "annotations: {} strokes + {} watermarks from {path} (MF burn-in)",
+                    doc.strokes.len(),
+                    doc.watermarks.len()
+                );
+                Some(doc)
+            }
+            None => None,
+        };
         let t0 = Instant::now();
         if let Some(title) = &args.window_title {
             eprintln!(
@@ -1685,6 +1700,7 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
                 duration,
                 stop,
                 pause_mf.clone(),
+                annotate.clone(),
             )?;
         } else if let Some(r) = &args.region {
             // Region is monitor-relative (origin at the target monitor's top-left).
@@ -1709,6 +1725,7 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
                 duration,
                 stop,
                 pause_mf.clone(),
+                annotate.clone(),
             )?;
         } else {
             // 0-based list position -> 1-based WGC index (both primary-first).
@@ -1729,6 +1746,7 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
                 duration,
                 stop,
                 pause_mf.clone(),
+                annotate.clone(),
             )?;
         }
         let el = t0.elapsed();
@@ -1749,6 +1767,14 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
             el.as_secs_f64(),
             size as f64 / 1_000_000.0
         );
+        // Hybrid model: the same doc is saved next to the video for re-editing.
+        if let Some(doc) = annotate {
+            let sidecar = qcapture_annotate::AnnotateDoc::sidecar_path_for(&output);
+            match doc.save(&sidecar) {
+                Ok(()) => eprintln!("sidecar: {sidecar}"),
+                Err(e) => eprintln!("warning: sidecar save failed: {e}"),
+            }
+        }
         Ok(())
     }
 }

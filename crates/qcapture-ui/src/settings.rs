@@ -49,6 +49,8 @@ pub struct PersistedSettings {
     pub cursor_ripple: bool,
     #[serde(default)]
     pub output_dir: String,
+    #[serde(default)]
+    pub countdown_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -73,6 +75,7 @@ impl Default for PersistedSettings {
             cursor_highlight: false,
             cursor_ripple: false,
             output_dir: String::new(),
+            countdown_enabled: false,
         }
     }
 }

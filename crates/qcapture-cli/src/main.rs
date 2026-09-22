@@ -158,6 +158,10 @@ struct RecordArgs {
     #[arg(long)]
     duration: Option<u64>,
 
+    /// Countdown seconds before recording starts (1..30). Ctrl-C cancels.
+    #[arg(long)]
+    countdown: Option<u64>,
+
     /// Hide cursor in recording.
     #[arg(long, default_value = "false")]
     no_cursor: bool,
@@ -1565,6 +1569,28 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
         let _ = ctrlc::set_handler(move || stop.store(true, Ordering::SeqCst));
     }
 
+    // Optional countdown before anything starts (all paths share it).
+    if let Some(secs) = args.countdown {
+        if !(1..=30).contains(&secs) {
+            anyhow::bail!("--countdown must be 1..30 seconds");
+        }
+        eprintln!("Recording in {secs}s… (Ctrl-C to cancel)");
+        let end = Instant::now() + Duration::from_secs(secs);
+        let mut shown = secs + 1;
+        while Instant::now() < end {
+            if stop.load(Ordering::SeqCst) {
+                eprintln!("cancelled.");
+                return Ok(());
+            }
+            let left = end.saturating_duration_since(Instant::now()).as_secs() + 1;
+            if left < shown {
+                shown = left;
+                eprintln!("  {left}…");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     #[cfg(not(windows))]
     {
         // No MediaFoundation off Windows: resolve everything to ffmpeg
@@ -1748,6 +1774,7 @@ mod tests {
             maxrate: None,
             output: None,
             duration: None,
+            countdown: None,
             no_cursor: false,
             no_audio: false,
             mic: None,

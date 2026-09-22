@@ -51,6 +51,8 @@ and a human smoke test per machine.
 - **Pause/resume** — widget ⏸ button or `--pause-at/--resume-at` seconds on
   the CLI. Both A/V clocks freeze together, so paused spans are cut from the
   file and sync is preserved. `--duration` stays wall-clock.
+- **Countdown** — widget ⏳ toggle (3s overlay, persisted) or `--countdown`
+  seconds on the CLI. Recording starts when it expires; Ctrl-C cancels.
 - **Floating widget** (`widget`) — target picker, Start/Stop, live audio
   controls, Advanced window (fps, bitrate, rate control, canvas, encoder,
   cursor capture), draw viewport, output folder shortcut.

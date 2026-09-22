@@ -362,6 +362,8 @@ pub fn run() -> Result<(), String> {
             .as_ref()
             .map(|s| s.output_dir.clone())
             .unwrap_or_default(),
+        countdown_enabled: saved.as_ref().map(|s| s.countdown_enabled).unwrap_or(false),
+        countdown_until: None,
         draw_ui: Arc::new(Mutex::new(None)),
         draw_open: Arc::new(AtomicBool::new(false)),
     };
@@ -440,6 +442,11 @@ struct WidgetApp {
     cursor_ripple: bool,
     /// Output folder (empty = current folder). Persisted; editable below.
     output_dir: String,
+    /// 3-second countdown before recording. Persisted toggle.
+    countdown_enabled: bool,
+    /// Countdown deadline once the user hits Record (None = idle).
+    /// Display-only overlay; cancelling happens in the main window.
+    countdown_until: Option<Instant>,
     draw_ui: Arc<Mutex<Option<DrawUiState>>>,
     /// Draw viewport visibility (closing it keeps recording; preview drops).
     draw_open: Arc<AtomicBool>,
@@ -506,6 +513,7 @@ impl WidgetApp {
             cursor_highlight: self.cursor_highlight,
             cursor_ripple: self.cursor_ripple,
             output_dir: self.output_dir.clone(),
+            countdown_enabled: self.countdown_enabled,
         }
     }
 
@@ -614,6 +622,50 @@ impl WidgetApp {
                     .map(|d| d.strokes.len())
                     .unwrap_or(0)
             );
+        }
+    }
+
+    /// Countdown length before a recording starts.
+    const COUNTDOWN_SECS: u64 = 3;
+
+    /// Pure deadline check (unit-testable without spawning a recording).
+    fn countdown_finished(deadline: Instant) -> bool {
+        Instant::now() >= deadline
+    }
+
+    /// Short target line for the countdown overlay.
+    fn target_desc(&self) -> String {
+        match &self.target {
+            TargetSel::Screen(s) => format!("Screen #{s}"),
+            TargetSel::Window(t) if t.trim().is_empty() => "Window […]".to_string(),
+            TargetSel::Window(t) => format!("Window '{t}'"),
+            TargetSel::Region { screen, rect } => {
+                format!(
+                    "Region {},{},{},{} on screen {screen}",
+                    rect.x, rect.y, rect.w, rect.h
+                )
+            }
+        }
+    }
+
+    /// Take an expired countdown deadline (clearing it), if any. Split out
+    /// so tests can verify expiry without spawning a real recording.
+    fn take_expired_countdown(&mut self) -> bool {
+        match self.countdown_until {
+            Some(d) if Self::countdown_finished(d) => {
+                self.countdown_until = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Fire the recording once the countdown expires. Runs at the top of
+    /// every update; starting goes through the normal path so behavior
+    /// matches an immediate Record press.
+    fn poll_countdown(&mut self) {
+        if self.take_expired_countdown() {
+            self.start_recording();
         }
     }
 
@@ -1435,8 +1487,9 @@ impl eframe::App for WidgetApp {
         self.poll_done();
         self.poll_pick();
         self.poll_annotate();
+        self.poll_countdown();
 
-        if self.recording() {
+        if self.recording() || self.countdown_until.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         // VU decay.
@@ -1463,6 +1516,35 @@ impl eframe::App for WidgetApp {
                     if ctx.input(|i| i.viewport().close_requested()) {
                         open.store(false, Ordering::Relaxed);
                     }
+                },
+            );
+        }
+
+        // Countdown overlay: display-only big number (same event loop).
+        // Cancelling happens in the main window; expiry fires the normal
+        // record path via poll_countdown above.
+        if let Some(deadline) = self.countdown_until {
+            let remaining = deadline.saturating_duration_since(Instant::now()).as_secs() + 1;
+            let desc = self.target_desc();
+            ctx.show_viewport_deferred(
+                egui::ViewportId::from_hash_of("qcapture-countdown"),
+                egui::ViewportBuilder::default()
+                    .with_title("QCapture — starting…")
+                    .with_inner_size([280.0, 170.0])
+                    .with_resizable(false)
+                    .with_always_on_top(),
+                move |ctx, _| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.vertical_centered(|ui| {
+                            ui.heading(format!("Recording {desc}"));
+                            ui.label(
+                                egui::RichText::new(format!("{remaining}"))
+                                    .size(72.0)
+                                    .strong(),
+                            );
+                            ui.label("Cancel in the main window");
+                        });
+                    });
                 },
             );
         }
@@ -1749,6 +1831,11 @@ impl eframe::App for WidgetApp {
                             "Live video + pen/shapes/text in a second window (ffmpeg encoders; closing it keeps recording)",
                         );
                 });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.countdown_enabled, "⏳ Countdown").on_hover_text(
+                        "3-second countdown overlay before recording starts",
+                    );
+                });
                 // Cursor fx is Windows-only (no portable cursor position API).
                 #[cfg(windows)]
                 ui.horizontal(|ui| {
@@ -1777,19 +1864,29 @@ impl eframe::App for WidgetApp {
                         }
                     }
                 });
-                if ui
+                if self.countdown_until.is_some() {
+                    // Countdown running: Record becomes Cancel.
+                    if ui
+                        .add_sized([390.0, 36.0], egui::Button::new("✕  Cancel countdown"))
+                        .clicked()
+                    {
+                        self.countdown_until = None;
+                        self.last_msg = "countdown cancelled.".to_string();
+                    }
+                } else if ui
                     .add_sized([390.0, 36.0], egui::Button::new("●  Record"))
                     .clicked()
                 {
                     // Validate window target early for a loud error instead of a
                     // background failure.
-                    if let TargetSel::Window(t) = &self.target {
-                        if t.trim().is_empty() {
-                            self.last_msg =
-                                "pick a window first (substring of its title)".to_string();
-                        } else {
-                            self.start_recording();
-                        }
+                    if matches!(&self.target, TargetSel::Window(t) if t.trim().is_empty()) {
+                        self.last_msg =
+                            "pick a window first (substring of its title)".to_string();
+                    } else if self.countdown_enabled {
+                        self.countdown_until = Some(
+                            Instant::now() + Duration::from_secs(Self::COUNTDOWN_SECS),
+                        );
+                        self.last_msg.clear();
                     } else {
                         self.start_recording();
                     }
@@ -1945,6 +2042,8 @@ mod tests {
             cursor_highlight: false,
             cursor_ripple: false,
             output_dir: String::new(),
+            countdown_enabled: false,
+            countdown_until: None,
             draw_ui: Arc::new(Mutex::new(None)),
             draw_open: Arc::new(AtomicBool::new(false)),
         }
@@ -2328,6 +2427,53 @@ mod tests {
             rec.content_elapsed() <= rec.started.elapsed(),
             "content clock never exceeds session clock"
         );
+    }
+
+    #[test]
+    fn countdown_finished_checks_deadline() {
+        use std::time::Duration;
+        assert!(WidgetApp::countdown_finished(
+            Instant::now() - Duration::from_secs(1)
+        ));
+        assert!(!WidgetApp::countdown_finished(
+            Instant::now() + Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn countdown_toggle_arms_and_cancels() {
+        let mut h = main_harness();
+        // Toggle on, then Record arms the countdown instead of recording.
+        h.get_by_label("⏳ Countdown").click();
+        h.run();
+        assert!(h.state().countdown_enabled);
+        h.get_by_label("●  Record").click();
+        // Counting down repaints continuously, so run() never settles —
+        // fixed steps process the queued clicks just as well.
+        h.run_steps(6);
+        assert!(h.state().rec.is_none());
+        assert!(h.state().countdown_until.is_some());
+        // Record button is replaced by Cancel while counting down.
+        h.get_by_label("✕  Cancel countdown").click();
+        h.run_steps(6);
+        assert!(h.state().countdown_until.is_none());
+        assert!(h.state().rec.is_none());
+    }
+
+    #[test]
+    fn countdown_expiry_takes_once() {
+        let mut app = test_app();
+        // Future deadline: kept, not taken.
+        app.countdown_until = Some(Instant::now() + Duration::from_secs(60));
+        assert!(!app.take_expired_countdown());
+        assert!(app.countdown_until.is_some());
+        // Past deadline: taken exactly once (poll never double-fires).
+        app.countdown_until = Some(Instant::now() - Duration::from_secs(1));
+        assert!(app.take_expired_countdown());
+        assert!(app.countdown_until.is_none());
+        assert!(!app.take_expired_countdown());
+        // Nothing armed: no-op.
+        assert!(!app.take_expired_countdown());
     }
 
     #[test]

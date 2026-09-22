@@ -1,0 +1,88 @@
+name: release
+
+# Cut a release: git tag vX.Y.Z && git push origin vX.Y.Z
+# (tag must match the workspace version in Cargo.toml).
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: qcapture.exe
+            suffix: windows-x86_64
+            ext: zip
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: qcapture
+            suffix: linux-x86_64
+            ext: tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: qcapture
+            suffix: macos-aarch64
+            ext: tar.gz
+    runs-on: ${{ matrix.os }}
+    env:
+      ARCHIVE: qcapture-${{ github.ref_name }}-${{ matrix.suffix }}.${{ matrix.ext }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Tag matches workspace version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test "$TAG" = "$VER" || { echo "tag v$TAG != workspace $VER"; exit 1; }
+      - name: Linux system deps (x11/winit, ALSA/cpal, D-Bus/accesskit)
+        if: runner.os == 'Linux'
+        run: >
+          sudo apt-get update &&
+          sudo apt-get install -y
+          pkg-config libdbus-1-dev libasound2-dev
+          libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+          libxkbcommon-dev libssl-dev
+      - run: cargo build --release --locked -p qcapture-cli --target ${{ matrix.target }}
+      - name: Stage package
+        shell: bash
+        run: |
+          mkdir -p pkg
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" pkg/
+          cp README.md pkg/
+      - name: Archive (zip on Windows)
+        shell: bash
+        run: |
+          cd pkg
+          if [[ "${{ matrix.os }}" == windows* ]]; then
+            7z a "../${{ env.ARCHIVE }}" *
+          else
+            tar czf "../${{ env.ARCHIVE }}" *
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: qcapture-*
+          generate_release_notes: true

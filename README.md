@@ -63,7 +63,21 @@ and a human smoke test per machine.
   bare `--encoder h264`/`hevc` resolve to the best available family member).
 - Release binary stays under ~11 MB.
 
-## Quickstart
+## Install
+
+Prebuilt binaries ride every GitHub release (`v*` tags):
+`qcapture-<version>-windows-x86_64.zip`,
+`qcapture-<version>-linux-x86_64.tar.gz`,
+`qcapture-<version>-macos-aarch64.tar.gz` — unpack and run.
+`ffmpeg` must be on PATH (see below). Platform notes:
+
+- **Windows**: SmartScreen may flag the unsigned exe (More info → Run anyway).
+- **Linux**: needs X11/Wayland client libs (present on any desktop install).
+  Window capture needs X11 — Wayland blocks screenshots by design.
+- **macOS**: unsigned build — right-click → Open on first launch, and grant
+  Screen Recording permission when asked.
+
+## Quickstart (from source)
 
 ```powershell
 cargo build --release -p qcapture-cli

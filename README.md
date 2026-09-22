@@ -46,6 +46,9 @@ and a human smoke test per machine.
   (Windows-only for now).
 - **Fixed canvas** — the encoder initializes once; resizes and window-size
   drift are center-cropped/padded mid-record instead of re-initing or freezing.
+- **Pause/resume** — widget ⏸ button or `--pause-at/--resume-at` seconds on
+  the CLI. Both A/V clocks freeze together, so paused spans are cut from the
+  file and sync is preserved. `--duration` stays wall-clock.
 - **Floating widget** (`widget`) — target picker, Start/Stop, live audio
   controls, Advanced window (fps, bitrate, rate control, canvas, encoder,
   cursor capture), draw viewport, output folder shortcut.
@@ -101,7 +104,7 @@ Key `record` flags: `--screen`, `--region x,y,w,h`, `--region-screen`,
 `--bitrate`, `--rc cbr|vbr|cqp|crf`, `--qp`, `--crf`, `--maxrate`, `--output`,
 `--duration`, `--no-cursor`, `--no-audio`, `--mic`, `--system-gain/--mic-gain`,
 `--system-mute/--mic-mute`, `--annotate`, `--draw`, `--draw-test`,
-`--cursor-highlight`, `--cursor-ripple`.
+`--cursor-highlight`, `--cursor-ripple`, `--pause-at`, `--resume-at`.
 
 Query flags: `--list-screens`, `--list-windows`, `--list-audio`,
 `--probe-ffmpeg`, `--canvas-presets` (each with `--json`).

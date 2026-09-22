@@ -36,6 +36,7 @@ struct PusherFlags {
     tx: flume::Sender<RawFrame>,
     stop_at: Option<Instant>,
     stop_flag: Arc<AtomicBool>,
+    pause_flag: Arc<AtomicBool>,
     /// Virtual-screen origin of the feed (monitor top-left; region adds the
     /// crop offset). Maps `GetCursorPos` into frame pixels for screen/region.
     origin: (i32, i32),
@@ -161,6 +162,12 @@ impl GraphicsCaptureApiHandler for Pusher {
                 control.stop();
                 return Ok(());
             }
+        }
+        // Paused: drop the frame entirely (pump idles, mixer idles — both
+        // clocks freeze, so A/V stay in sync). next_tick goes stale, which
+        // is exactly right: the first frame after resume sends immediately.
+        if self.flags.pause_flag.load(Ordering::Relaxed) {
+            return Ok(());
         }
         // Decimate WGC's bursty delivery (up to display refresh) to target fps.
         let now = Instant::now();
@@ -307,6 +314,7 @@ where
             tx,
             stop_at: job.duration.map(|d| Instant::now() + d),
             stop_flag: job.stop_flag,
+            pause_flag: job.pause_flag.clone(),
             origin,
             hwnd,
             sample_cursor,
@@ -394,6 +402,7 @@ fn run_cropped(
             tx,
             stop_at: job.duration.map(|d| Instant::now() + d),
             stop_flag: job.stop_flag,
+            pause_flag: job.pause_flag.clone(),
             origin,
             hwnd: None,
             sample_cursor,

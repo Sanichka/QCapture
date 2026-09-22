@@ -34,6 +34,8 @@ pub struct PortAudioConfig {
     pub capture_system: bool,
     pub mic_query: Option<String>,
     pub levels: Arc<SharedLevels>,
+    /// Pause flag shared with the video backend (see `WinAudioConfig::pause`).
+    pub pause: Arc<AtomicBool>,
 }
 
 /// Live pipeline. `mixed_rx` yields consecutive 1920-byte i16-stereo-48k chunks.
@@ -239,8 +241,20 @@ fn mixer_thread_main(
 
     let quantum = Duration::from_nanos(1_000_000_000 / (OUT_RATE as u64 / QUANTUM_FRAMES as u64));
     let mut deadline = Instant::now() + quantum;
+    let pause = config.pause.clone();
 
     while !stop.load(Ordering::SeqCst) {
+        // --- paused: freeze the audio clock (see win_audio mixer) ---
+        if pause.load(Ordering::Relaxed) {
+            if let Some(rx) = sys_rx.as_ref() {
+                while rx.try_recv().is_ok() {}
+            }
+            sys_fifo.clear();
+            while mic_rx.try_recv().is_ok() {}
+            mic_fifo.clear();
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
         // --- pull system packets (device rate, stereo-ized) ---
         if let Some(rx) = sys_rx.as_ref() {
             while let Ok(pkt) = rx.try_recv() {

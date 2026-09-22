@@ -203,6 +203,15 @@ struct RecordArgs {
     #[arg(long)]
     draw_test: Option<u64>,
 
+    /// Auto-pause N seconds in (headless testing / timed breaks).
+    /// Needs --resume-at. Paused spans are cut from both A/V clocks.
+    #[arg(long)]
+    pause_at: Option<u64>,
+
+    /// Auto-resume N seconds in. Needs --pause-at (must be later).
+    #[arg(long)]
+    resume_at: Option<u64>,
+
     /// Burn a highlight ring around the cursor (ffmpeg path; native
     /// encoders auto-switch just like --annotate/--draw).
     #[arg(long, default_value = "false")]
@@ -632,7 +641,7 @@ impl CliAudio {
 /// `--no-audio`, mic opt-in. Fail-soft on system-only trouble; loud on
 /// explicit `--mic` typos. Backend per OS: WASAPI loopback on Windows,
 /// cpal monitor source on Linux, mic-only on macOS.
-fn start_cli_audio(args: &RecordArgs) -> anyhow::Result<Option<CliAudio>> {
+fn start_cli_audio(args: &RecordArgs, pause: &Arc<AtomicBool>) -> anyhow::Result<Option<CliAudio>> {
     if args.no_audio {
         return Ok(None);
     }
@@ -648,6 +657,7 @@ fn start_cli_audio(args: &RecordArgs) -> anyhow::Result<Option<CliAudio>> {
             capture_system: true,
             mic_query: args.mic.clone(),
             levels,
+            pause: pause.clone(),
         };
         qcapture_audio::win_audio::start_pipeline(cfg).map(CliAudio::Win)
     };
@@ -657,6 +667,7 @@ fn start_cli_audio(args: &RecordArgs) -> anyhow::Result<Option<CliAudio>> {
             capture_system: true,
             mic_query: args.mic.clone(),
             levels,
+            pause: pause.clone(),
         };
         qcapture_audio::portable::start_pipeline(cfg).map(CliAudio::Port)
     };
@@ -679,6 +690,36 @@ fn start_cli_audio(args: &RecordArgs) -> anyhow::Result<Option<CliAudio>> {
             Ok(None)
         }
     }
+}
+
+/// Timed auto-pause for headless runs and tests: set `pause` at `pause_at`
+/// seconds, clear it at `resume_at`. Paused spans vanish from both A/V
+/// clocks, so `frames ≈ (duration − paused) × fps` is assertable.
+fn spawn_pause_timer(
+    pause: &Arc<AtomicBool>,
+    pause_at: Option<u64>,
+    resume_at: Option<u64>,
+) -> anyhow::Result<()> {
+    let (p, r) = match (pause_at, resume_at) {
+        (None, None) => return Ok(()),
+        (Some(p), Some(r)) if p < r => (p, r),
+        (Some(_), None) => anyhow::bail!("--resume-at is required with --pause-at"),
+        (None, Some(_)) => anyhow::bail!("--pause-at is required with --resume-at"),
+        _ => anyhow::bail!("--pause-at must be < --resume-at"),
+    };
+    let flag = pause.clone();
+    std::thread::Builder::new()
+        .name("qcapture-pause-timer".into())
+        .spawn(move || {
+            std::thread::sleep(Duration::from_secs(p));
+            flag.store(true, Ordering::SeqCst);
+            eprintln!("paused at {p}s (resuming at {r}s)…");
+            std::thread::sleep(Duration::from_secs(r.saturating_sub(p)));
+            flag.store(false, Ordering::SeqCst);
+            eprintln!("resumed at {r}s.");
+        })
+        .map_err(|e| anyhow::anyhow!("pause timer spawn: {e}"))?;
+    Ok(())
 }
 
 /// Self-test driver: two scripted strokes through the same channel a mouse
@@ -870,7 +911,10 @@ fn run_draw_record(
         (d.width.max(64) & !1, d.height.max(64) & !1)
     };
     let t0 = Instant::now();
-    let audio = start_cli_audio(args)?;
+    // Pause flag shared by video backend, audio mixer and the CLI timer.
+    let pause = Arc::new(AtomicBool::new(false));
+    spawn_pause_timer(&pause, args.pause_at, args.resume_at)?;
+    let audio = start_cli_audio(args, &pause)?;
     let pipe = if audio.is_some() {
         Some(
             qcapture_encode::audio_pipe::FfmpegAudioPipe::create()
@@ -913,6 +957,7 @@ fn run_draw_record(
     let screen = args.screen;
     let fps = args.fps;
     let stop_t = stop.clone();
+    let pause_t = pause.clone();
     let output_s = output.to_string();
     let annotate_t = annotate.clone();
     let canvas_t = canvas;
@@ -929,6 +974,7 @@ fn run_draw_record(
                 output: output_s.clone(),
                 duration,
                 stop_flag: stop_t.clone(),
+                pause_flag: pause_t.clone(),
                 annotate: annotate_t.clone(),
                 cursor_fx,
                 cursor_window: window_hwnd,
@@ -1134,10 +1180,13 @@ fn run_ffmpeg_record(
         None => None,
     };
     let t0 = Instant::now();
+    // Pause flag shared by video backend, audio mixer and the CLI timer.
+    let pause = Arc::new(AtomicBool::new(false));
+    spawn_pause_timer(&pause, args.pause_at, args.resume_at)?;
     // Audio: same pipeline as MF; chunks forward into the ffmpeg named pipe.
     // The on_capture_end callback shuts the pipeline down BEFORE the pump join
     // (pipe EOF lets ffmpeg exit — reversed order deadlocks).
-    let audio = start_cli_audio(args)?;
+    let audio = start_cli_audio(args, &pause)?;
     let pipe = if audio.is_some() {
         Some(
             qcapture_encode::audio_pipe::FfmpegAudioPipe::create()
@@ -1181,6 +1230,7 @@ fn run_ffmpeg_record(
         output: output.to_string(),
         duration,
         stop_flag: stop.clone(),
+        pause_flag: pause.clone(),
         annotate: annotate.clone(),
         cursor_fx,
         cursor_window: cursor_hwnd,
@@ -1440,9 +1490,16 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
     // Phase 3 audio: system loopback on by default, mic opt-in. Fail-soft —
     // a broken audio device must never lose the video recording.
     // (MF path only here — the ffmpeg branch starts its own via start_cli_audio.)
+    // Pause flag shared by the MF recorder, the audio mixer and the timer.
+    #[cfg(windows)]
+    let pause_mf = {
+        let pause = Arc::new(AtomicBool::new(false));
+        spawn_pause_timer(&pause, args.pause_at, args.resume_at)?;
+        pause
+    };
     #[cfg(windows)]
     let audio = if !args.no_audio && !matches!(path, PathSel::Ffmpeg(_)) {
-        start_cli_audio(&args)?
+        start_cli_audio(&args, &pause_mf)?
     } else {
         None
     };
@@ -1494,6 +1551,7 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
                 audio_rx,
                 duration,
                 stop,
+                pause_mf.clone(),
             )?;
         } else if let Some(r) = &args.region {
             // Region is monitor-relative (origin at the target monitor's top-left).
@@ -1517,6 +1575,7 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
                 audio_rx.clone(),
                 duration,
                 stop,
+                pause_mf.clone(),
             )?;
         } else {
             // 0-based list position -> 1-based WGC index (both primary-first).
@@ -1536,6 +1595,7 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
                 audio_rx,
                 duration,
                 stop,
+                pause_mf.clone(),
             )?;
         }
         let el = t0.elapsed();

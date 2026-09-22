@@ -48,6 +48,10 @@ pub struct FfmpegJob {
     pub output: String,
     pub duration: Option<Duration>,
     pub stop_flag: Arc<AtomicBool>,
+    /// Pause flag (widget button / CLI timer). While set, backends stop
+    /// forwarding frames and mixers stop emitting quanta — both clocks
+    /// freeze together, so A/V stay in sync across the gap.
+    pub pause_flag: Arc<AtomicBool>,
     /// Timed annotations to burn in (norm coords resolved against feed size).
     /// None = clean feed. MF path does not support this in 4a.
     pub annotate: Option<AnnotateDoc>,

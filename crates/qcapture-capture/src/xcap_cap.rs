@@ -128,6 +128,7 @@ pub fn run_xcap_monitor(
     let fps = job.fps;
     let stop_at = deadline_of(&job);
     let stop_flag = job.stop_flag.clone();
+    let pause_flag = job.pause_flag.clone();
     run_with_bridge(
         feed_w,
         feed_h,
@@ -166,6 +167,12 @@ pub fn run_xcap_monitor(
                 let mut latest = first;
                 while let Ok(f) = rx.try_recv() {
                     latest = f;
+                }
+                // Paused: drop the frame (pump and mixer idle — both clocks
+                // freeze, so A/V stay in sync). The pacer goes stale, so the
+                // first frame after resume sends immediately.
+                if pause_flag.load(Ordering::Relaxed) {
+                    continue;
                 }
                 if !pacer.poll() {
                     continue;
@@ -241,6 +248,7 @@ pub fn run_xcap_region(
     let fps = job.fps;
     let stop_at = deadline_of(&job);
     let stop_flag = job.stop_flag.clone();
+    let pause_flag = job.pause_flag.clone();
     run_with_bridge(
         w,
         h,
@@ -275,6 +283,9 @@ pub fn run_xcap_region(
                 let mut latest = first;
                 while let Ok(f) = rx.try_recv() {
                     latest = f;
+                }
+                if pause_flag.load(Ordering::Relaxed) {
+                    continue;
                 }
                 if !pacer.poll() {
                     continue;
@@ -337,6 +348,7 @@ pub fn run_xcap_window(
     let fps = job.fps;
     let stop_at = deadline_of(&job);
     let stop_flag = job.stop_flag.clone();
+    let pause_flag = job.pause_flag.clone();
     run_with_bridge(
         feed_w,
         feed_h,
@@ -358,6 +370,12 @@ pub fn run_xcap_window(
                 if stop_flag.load(Ordering::SeqCst) || stop_at.is_some_and(|t| Instant::now() >= t)
                 {
                     break;
+                }
+                // Paused: skip screenshots entirely (saves CPU); the pacer
+                // goes stale so the first frame after resume sends promptly.
+                if pause_flag.load(Ordering::Relaxed) {
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
                 }
                 if !pacer.poll() {
                     std::thread::sleep(Duration::from_millis(2));

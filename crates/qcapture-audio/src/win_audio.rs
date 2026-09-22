@@ -28,6 +28,10 @@ pub struct WinAudioConfig {
     pub capture_system: bool,
     pub mic_query: Option<String>,
     pub levels: std::sync::Arc<SharedLevels>,
+    /// Pause flag shared with the video backend: while set the mixer emits
+    /// nothing and discards inputs, freezing the audio clock in step with
+    /// the frozen video clock.
+    pub pause: Arc<AtomicBool>,
 }
 
 /// Live pipeline. `mixed_rx` yields consecutive 1920-byte i16-stereo-48k chunks.
@@ -189,8 +193,22 @@ fn mixer_thread_main(
 
     let quantum = Duration::from_nanos(1_000_000_000 / (OUT_RATE as u64 / QUANTUM_FRAMES as u64));
     let mut deadline = Instant::now() + quantum;
+    let pause = config.pause.clone();
 
     while !stop.load(Ordering::SeqCst) {
+        // --- paused: freeze the audio clock (discard inputs, emit nothing).
+        // The deadline is left stale so the stall-resync below re-arms
+        // pacing on resume; fifos are cleared so no burst plays.
+        if pause.load(Ordering::Relaxed) {
+            if let Some(lb) = loopback.as_mut() {
+                let _ = lb.drain_into(&mut sys_fifo);
+            }
+            sys_fifo.clear();
+            while mic_rx.try_recv().is_ok() {}
+            mic_fifo.clear();
+            thread::sleep(Duration::from_millis(10));
+            continue;
+        }
         // --- pull system audio (non-blocking drain) ---
         if let Some(lb) = loopback.as_mut() {
             match lb.drain_into(&mut sys_fifo) {

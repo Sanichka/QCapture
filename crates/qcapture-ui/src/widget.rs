@@ -183,7 +183,30 @@ struct ActiveRec {
     started: Instant,
     output: String,
     stop: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
     done: Arc<Mutex<Option<RecDone>>>,
+    /// Wall time spent paused so far + ongoing pause start. The readout
+    /// shows content time (what lands in the file), not session time.
+    paused_total: Duration,
+    pause_began: Option<Instant>,
+}
+
+impl ActiveRec {
+    /// Content clock: session time minus paused spans (including an ongoing
+    /// pause, so the readout freezes while paused).
+    fn content_elapsed(&self) -> Duration {
+        let paused = self.paused_total + self.pause_began.map(|b| b.elapsed()).unwrap_or_default();
+        self.started.elapsed().saturating_sub(paused)
+    }
+
+    fn set_paused(&mut self, paused: bool) {
+        self.pause.store(paused, Ordering::Relaxed);
+        if paused {
+            self.pause_began = Some(Instant::now());
+        } else if let Some(began) = self.pause_began.take() {
+            self.paused_total += began.elapsed();
+        }
+    }
 }
 
 struct RecDone {
@@ -556,6 +579,7 @@ impl WidgetApp {
         };
         self.save_settings();
         let stop = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
         let done = Arc::new(Mutex::new(None));
         let target = self.target.clone();
         let levels = self.levels.clone();
@@ -567,6 +591,7 @@ impl WidgetApp {
         let audio_on = self.audio_on;
         let out_path = output.clone();
         let stop_t = stop.clone();
+        let pause_t = pause.clone();
         let done_t = done.clone();
         let annotate = self.pending_doc.clone();
         let cursor_fx = qcapture_core::CursorFx::opt(self.cursor_highlight, self.cursor_ripple);
@@ -602,7 +627,7 @@ impl WidgetApp {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     record_thread_body(
                         &target, &adv, &out_path, mic_name, audio_on, levels, annotate, draw_caps,
-                        cursor_fx, screens_t, stop_t,
+                        cursor_fx, &screens_t, pause_t, stop_t,
                     )
                 }));
                 let msg = match result {
@@ -620,7 +645,10 @@ impl WidgetApp {
             started: Instant::now(),
             output,
             stop,
+            pause,
             done,
+            paused_total: Duration::ZERO,
+            pause_began: None,
         });
         self.last_msg.clear();
     }
@@ -840,7 +868,8 @@ fn record_thread_body(
     annotate: Option<qcapture_annotate::AnnotateDoc>,
     draw_caps: Option<DrawCaptureEnds>,
     cursor_fx: Option<qcapture_core::CursorFx>,
-    screens: Vec<DisplayInfo>,
+    _screens: &[DisplayInfo],
+    pause: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) -> Result<String, String> {
     // Staged annotations, live drawing AND cursor fx need the ffmpeg byte
@@ -889,7 +918,7 @@ fn record_thread_body(
     if let Some(kind) = ffmpeg_kind {
         return record_thread_ffmpeg(
             target, adv, output, kind, mic_name, audio_on, levels, annotate, draw_caps, cursor_fx,
-            &screens, stop,
+            _screens, pause, stop,
         )
         .map(|m| format!("{m}{switched_note}"));
     }
@@ -914,6 +943,7 @@ fn record_thread_body(
             capture_system: true,
             mic_query: mic_name.clone(),
             levels: levels.clone(),
+            pause: pause.clone(),
         };
         match qcapture_audio::win_audio::start_pipeline(cfg) {
             Ok(p) => Some(p),
@@ -948,6 +978,7 @@ fn record_thread_body(
                     audio_rx,
                     None,
                     stop,
+                    pause.clone(),
                 )
             }
             TargetSel::Window(title) => rec::record_window_title(
@@ -959,6 +990,7 @@ fn record_thread_body(
                 audio_rx,
                 None,
                 stop,
+                pause.clone(),
             ),
             TargetSel::Region { screen, rect } => {
                 let idx = qcapture_capture::wgc_monitor_index(*screen);
@@ -975,6 +1007,7 @@ fn record_thread_body(
                     audio_rx,
                     None,
                     stop,
+                    pause.clone(),
                 )
             }
         };
@@ -1020,6 +1053,7 @@ fn record_thread_ffmpeg(
     draw_caps: Option<DrawCaptureEnds>,
     cursor_fx: Option<qcapture_core::CursorFx>,
     _screens: &[DisplayInfo],
+    pause: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 ) -> Result<String, String> {
     #[cfg(windows)]
@@ -1053,6 +1087,7 @@ fn record_thread_ffmpeg(
                 capture_system: true,
                 mic_query: mic_name.clone(),
                 levels: levels.clone(),
+                pause: pause.clone(),
             };
             qcapture_audio::win_audio::start_pipeline(cfg)
                 .map(qcapture_audio::AnyAudioPipeline::Win)
@@ -1063,6 +1098,7 @@ fn record_thread_ffmpeg(
                 capture_system: true,
                 mic_query: mic_name.clone(),
                 levels: levels.clone(),
+                pause: pause.clone(),
             };
             qcapture_audio::portable::start_pipeline(cfg)
                 .map(qcapture_audio::AnyAudioPipeline::Port)
@@ -1127,6 +1163,7 @@ fn record_thread_ffmpeg(
         output: output.to_string(),
         duration: None, // widget stops via the flag (Stop button / close)
         stop_flag: stop.clone(),
+        pause_flag: pause.clone(),
         annotate: annotate.clone(),
         cursor_fx,
         cursor_window: cursor_hwnd,
@@ -1646,15 +1683,26 @@ impl eframe::App for WidgetApp {
                 self.stop_recording();
             }
 
-            if let Some(r) = &self.rec {
-                let el = r.started.elapsed();
+            if let Some(r) = &mut self.rec {
+                let el = r.content_elapsed();
                 let size = std::fs::metadata(&r.output).map(|m| m.len()).unwrap_or(0);
-                ui.label(format!(
-                    "⏺ {:.0}s — {:.2} MB\n{}",
-                    el.as_secs_f64(),
-                    size as f64 / 1_000_000.0,
-                    r.output
-                ));
+                let paused = r.pause.load(Ordering::Relaxed);
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button(if paused { "▶ Resume" } else { "⏸ Pause" })
+                        .on_hover_text("Freeze both A/V clocks; paused spans are cut")
+                        .clicked()
+                    {
+                        r.set_paused(!paused);
+                    }
+                    ui.label(format!(
+                        "{} {:.0}s — {:.2} MB\n{}",
+                        if paused { "⏸" } else { "⏺" },
+                        el.as_secs_f64(),
+                        size as f64 / 1_000_000.0,
+                        r.output
+                    ));
+                });
                 if self.last_msg == "finalizing…" {
                     ui.spinner();
                 }
@@ -2100,6 +2148,49 @@ mod tests {
             TargetSel::Window(t) => assert_eq!(t, "Notepad doc"),
             other => panic!("expected Window, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pause_button_freezes_and_resumes() {
+        let mut app = test_app();
+        // Fake an in-progress recording (no threads — only the flag matters).
+        app.rec = Some(ActiveRec {
+            started: Instant::now(),
+            output: "test.mp4".into(),
+            stop: Arc::new(AtomicBool::new(false)),
+            pause: Arc::new(AtomicBool::new(false)),
+            done: Arc::new(Mutex::new(None)),
+            paused_total: Duration::ZERO,
+            pause_began: None,
+        });
+        let mut h = Harness::builder()
+            .with_size(eframe::egui::Vec2::new(420.0, 760.0))
+            .build_eframe(|_cc| app);
+        // A live recording repaints continuously, so run() never settles —
+        // fixed steps process the queued click events just as well.
+        assert!(!h
+            .state()
+            .rec
+            .as_ref()
+            .unwrap()
+            .pause
+            .load(Ordering::Relaxed));
+        h.get_by_label("⏸ Pause").click();
+        h.run_steps(6);
+        let rec = h.state().rec.as_ref().unwrap();
+        assert!(rec.pause.load(Ordering::Relaxed));
+        assert!(rec.pause_began.is_some(), "pausing starts the clock");
+        // Button flips to Resume; clicking again clears the flag and banks
+        // the paused span, so the content clock excludes it.
+        h.get_by_label("▶ Resume").click();
+        h.run_steps(6);
+        let rec = h.state().rec.as_ref().unwrap();
+        assert!(!rec.pause.load(Ordering::Relaxed));
+        assert!(rec.pause_began.is_none());
+        assert!(
+            rec.content_elapsed() <= rec.started.elapsed(),
+            "content clock never exceeds session clock"
+        );
     }
 
     #[test]

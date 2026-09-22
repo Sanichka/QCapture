@@ -41,6 +41,9 @@ pub struct RecordFlags {
     pub audio_rx: Option<flume::Receiver<Vec<u8>>>,
     pub stop_at: Option<Instant>,
     pub stop_flag: Arc<AtomicBool>,
+    /// Pause flag: while set, video frames are skipped AND audio chunks are
+    /// drained-and-dropped, freezing both clocks together (A/V stay in sync).
+    pub pause_flag: Arc<AtomicBool>,
 }
 
 struct Recorder {
@@ -114,6 +117,14 @@ impl GraphicsCaptureApiHandler for Recorder {
                 control.stop();
                 return Ok(());
             }
+        }
+        if self.flags.pause_flag.load(Ordering::Relaxed) {
+            // Freeze both clocks: drop the video frame and drain-drop audio
+            // so no backlog plays as a burst on resume (mixer idles too).
+            if let Some(rx) = &self.flags.audio_rx {
+                while rx.try_recv().is_ok() {}
+            }
+            return Ok(());
         }
         // Audio first: drain all pending mixed chunks (timestamps ignored by
         // the encoder — monotonic sample clock). WGC delivers 100+ frames/s so
@@ -202,6 +213,7 @@ pub fn record_monitor(
     audio_rx: Option<flume::Receiver<Vec<u8>>>,
     duration: Option<Duration>,
     stop_flag: Arc<AtomicBool>,
+    pause_flag: Arc<AtomicBool>,
 ) -> Result<u64, CaptureError> {
     let monitor =
         Monitor::from_index(monitor_1based).map_err(|e| CaptureError::Backend(e.to_string()))?;
@@ -246,6 +258,7 @@ pub fn record_monitor(
             audio_rx,
             stop_at: duration.map(|d| Instant::now() + d),
             stop_flag,
+            pause_flag,
         },
     );
 
@@ -277,6 +290,7 @@ pub fn record_region(
     audio_rx: Option<flume::Receiver<Vec<u8>>>,
     duration: Option<Duration>,
     stop_flag: Arc<AtomicBool>,
+    pause_flag: Arc<AtomicBool>,
 ) -> Result<u64, CaptureError> {
     let monitor =
         Monitor::from_index(monitor_1based).map_err(|e| CaptureError::Backend(e.to_string()))?;
@@ -324,6 +338,7 @@ pub fn record_region(
             audio_rx,
             stop_at: duration.map(|d| Instant::now() + d),
             stop_flag,
+            pause_flag,
         },
     );
     eprintln!("WGC monitor#{monitor_1based} region {w}x{h}+{x}+{y} (of {native_w}x{native_h}) -> {output}");
@@ -342,6 +357,7 @@ pub fn record_window_title(
     audio_rx: Option<flume::Receiver<Vec<u8>>>,
     duration: Option<Duration>,
     stop_flag: Arc<AtomicBool>,
+    pause_flag: Arc<AtomicBool>,
 ) -> Result<u64, CaptureError> {
     let window = Window::from_contains_name(needle)
         .map_err(|e| CaptureError::Backend(format!("no window matching '{needle}': {e}")))?;
@@ -375,6 +391,7 @@ pub fn record_window_title(
             audio_rx,
             stop_at: duration.map(|d| Instant::now() + d),
             stop_flag,
+            pause_flag,
         },
     );
     Recorder::start(settings).map_err(|e| CaptureError::Backend(e.to_string()))?;

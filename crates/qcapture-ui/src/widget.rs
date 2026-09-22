@@ -19,6 +19,29 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 /// Advanced capture settings, shared with the detached Advanced window.
+fn default_hl_rgba() -> [u8; 4] {
+    [255, 210, 0, 255]
+}
+
+fn default_ripple_rgba() -> [u8; 4] {
+    [255, 255, 255, 255]
+}
+
+/// Accept settings files written before alpha existed ([u8;3] → opaque).
+fn de_rgba<'de, D>(d: D) -> Result<[u8; 4], D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: Vec<u8> = serde::Deserialize::deserialize(d)?;
+    match v.as_slice() {
+        [r, g, b] => Ok([*r, *g, *b, 255]),
+        [r, g, b, a] => Ok([*r, *g, *b, *a]),
+        _ => Err(serde::de::Error::custom(
+            "color must be [r,g,b] or [r,g,b,a]",
+        )),
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AdvCfg {
     pub fps: u32,
@@ -30,6 +53,34 @@ pub struct AdvCfg {
     pub qp: u8,
     pub crf: u8,
     pub maxrate_kbps: u32,
+    /// Cursor fx style (serde defaults keep pre-style settings files loading;
+    /// `de_rgba` additionally accepts the pre-alpha [r,g,b] arrays).
+    #[serde(default = "default_hl_rgba", deserialize_with = "de_rgba")]
+    pub cursor_color: [u8; 4],
+    #[serde(default = "default_cursor_size")]
+    pub cursor_size: f32,
+    #[serde(default = "default_ripple_rgba", deserialize_with = "de_rgba")]
+    pub ripple_color: [u8; 4],
+    #[serde(default = "default_ripple_size")]
+    pub ripple_size: f32,
+    #[serde(default = "default_ripple_ms")]
+    pub ripple_ms: u32,
+    /// Additive glow instead of normal blending (egui's picker "Additive"
+    /// radio can't survive u8 storage, so glow is an explicit flag).
+    #[serde(default)]
+    pub additive: bool,
+}
+
+fn default_cursor_size() -> f32 {
+    14.0
+}
+
+fn default_ripple_size() -> f32 {
+    42.0
+}
+
+fn default_ripple_ms() -> u32 {
+    600
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -112,6 +163,12 @@ impl Default for AdvCfg {
             qp: 23,
             crf: 23,
             maxrate_kbps: 12000,
+            cursor_color: default_hl_rgba(),
+            cursor_size: default_cursor_size(),
+            ripple_color: default_ripple_rgba(),
+            ripple_size: default_ripple_size(),
+            ripple_ms: default_ripple_ms(),
+            additive: false,
         }
     }
 }
@@ -126,6 +183,9 @@ impl AdvCfg {
     pub const MAXRATE_RANGE: std::ops::RangeInclusive<u32> = 1000..=80000;
     pub const QP_RANGE: std::ops::RangeInclusive<u8> = 0..=51;
     pub const GAIN_DB_RANGE: std::ops::RangeInclusive<f32> = -60.0..=12.0;
+    pub const CURSOR_RADIUS_RANGE: std::ops::RangeInclusive<f32> = 6.0..=40.0;
+    pub const RIPPLE_RADIUS_RANGE: std::ops::RangeInclusive<f32> = 12.0..=120.0;
+    pub const RIPPLE_MS_RANGE: std::ops::RangeInclusive<u32> = 100..=3000;
 
     /// Clamp every numeric field into its slider range. Applied to settings
     /// loaded from disk (hand-edited files can hold anything); the live
@@ -146,6 +206,17 @@ impl AdvCfg {
         self.crf = self
             .crf
             .clamp(*Self::QP_RANGE.start(), *Self::QP_RANGE.end());
+        self.cursor_size = self.cursor_size.clamp(
+            *Self::CURSOR_RADIUS_RANGE.start(),
+            *Self::CURSOR_RADIUS_RANGE.end(),
+        );
+        self.ripple_size = self.ripple_size.clamp(
+            *Self::RIPPLE_RADIUS_RANGE.start(),
+            *Self::RIPPLE_RADIUS_RANGE.end(),
+        );
+        self.ripple_ms = self
+            .ripple_ms
+            .clamp(*Self::RIPPLE_MS_RANGE.start(), *Self::RIPPLE_MS_RANGE.end());
         if let Some((w, h)) = self.canvas {
             if w < 64 || h < 64 {
                 self.canvas = None;
@@ -594,7 +665,20 @@ impl WidgetApp {
         let pause_t = pause.clone();
         let done_t = done.clone();
         let annotate = self.pending_doc.clone();
-        let cursor_fx = qcapture_core::CursorFx::opt(self.cursor_highlight, self.cursor_ripple);
+        let style = self
+            .adv
+            .lock()
+            .map(|a| qcapture_core::CursorStyle {
+                hl_rgba: a.cursor_color,
+                hl_radius: a.cursor_size,
+                ripple_rgba: a.ripple_color,
+                ripple_radius: a.ripple_size,
+                ripple_ms: a.ripple_ms,
+                additive: a.additive,
+            })
+            .unwrap_or_default();
+        let cursor_fx =
+            qcapture_core::CursorFx::opt_with(self.cursor_highlight, self.cursor_ripple, style);
         let screens_t = self.screens.clone();
         // Draw channels: UI keeps tx+rx+panel, capture gets rx+tx.
         let draw_caps = if let Some((fw, fh)) = draw_feed {
@@ -1309,6 +1393,40 @@ fn show_advanced_panel(ui: &mut egui::Ui, a: &mut AdvCfg) {
             }
         });
     ui.checkbox(&mut a.show_cursor, "Capture cursor");
+    ui.separator();
+    ui.heading("Cursor fx style");
+    ui.label("Burned in when highlight/clicks are on (ffmpeg encoders).");
+    ui.horizontal(|ui| {
+        ui.label("Ring color");
+        let mut c = egui::Color32::from_rgba_unmultiplied(
+            a.cursor_color[0],
+            a.cursor_color[1],
+            a.cursor_color[2],
+            a.cursor_color[3],
+        );
+        if super::pick_color_no_additive(ui, &mut c) {
+            a.cursor_color = [c.r(), c.g(), c.b(), c.a()];
+        }
+        ui.label("Ripple color");
+        let mut r = egui::Color32::from_rgba_unmultiplied(
+            a.ripple_color[0],
+            a.ripple_color[1],
+            a.ripple_color[2],
+            a.ripple_color[3],
+        );
+        if super::pick_color_no_additive(ui, &mut r) {
+            a.ripple_color = [r.r(), r.g(), r.b(), r.a()];
+        }
+    });
+    ui.checkbox(&mut a.additive, "Additive glow")
+        .on_hover_text("Add light instead of blending over");
+    ui.add(
+        egui::Slider::new(&mut a.cursor_size, AdvCfg::CURSOR_RADIUS_RANGE).text("ring radius px"),
+    );
+    ui.add(
+        egui::Slider::new(&mut a.ripple_size, AdvCfg::RIPPLE_RADIUS_RANGE).text("ripple radius px"),
+    );
+    ui.add(egui::Slider::new(&mut a.ripple_ms, AdvCfg::RIPPLE_MS_RANGE).text("ripple lifetime ms"));
     ui.label("ffmpeg entries mix AAC via named pipe.");
 }
 
@@ -1911,12 +2029,18 @@ mod tests {
             maxrate_kbps: 0,
             qp: 0,
             crf: 0,
+            cursor_size: 0.0,
+            ripple_size: 0.0,
+            ripple_ms: 0,
             ..Default::default()
         };
         a.sanitize();
         assert_eq!(a.fps, 15);
         assert_eq!(a.bitrate_kbps, 1000);
         assert_eq!(a.maxrate_kbps, 1000);
+        assert_eq!(a.cursor_size, 6.0);
+        assert_eq!(a.ripple_size, 12.0);
+        assert_eq!(a.ripple_ms, 100);
 
         let mut a = AdvCfg {
             fps: 30,
@@ -1924,12 +2048,19 @@ mod tests {
             maxrate_kbps: 12000,
             qp: 23,
             crf: 23,
+            cursor_size: 20.0,
+            ripple_size: 60.0,
+            ripple_ms: 900,
             ..Default::default()
         };
         a.sanitize();
         assert_eq!(
             (a.fps, a.bitrate_kbps, a.maxrate_kbps, a.qp, a.crf),
             (30, 8000, 12000, 23, 23)
+        );
+        assert_eq!(
+            (a.cursor_size, a.ripple_size, a.ripple_ms),
+            (20.0, 60.0, 900)
         );
 
         let mut a = AdvCfg {
@@ -1938,6 +2069,9 @@ mod tests {
             maxrate_kbps: 999_999,
             qp: 255,
             crf: 255,
+            cursor_size: 999.0,
+            ripple_size: 999.0,
+            ripple_ms: 99999,
             ..Default::default()
         };
         a.sanitize();
@@ -1946,6 +2080,9 @@ mod tests {
         assert_eq!(a.maxrate_kbps, 80000);
         assert_eq!(a.qp, 51);
         assert_eq!(a.crf, 51);
+        assert_eq!(a.cursor_size, 40.0);
+        assert_eq!(a.ripple_size, 120.0);
+        assert_eq!(a.ripple_ms, 3000);
     }
 
     #[test]
@@ -2228,6 +2365,42 @@ mod tests {
         assert_eq!(h.state().bitrate_kbps, 50000);
         drag_slider_to(&mut h, "bitrate kbps (CBR/VBR target)", 0.0);
         assert_eq!(h.state().bitrate_kbps, 1000);
+    }
+
+    #[test]
+    fn color_picker_has_no_additive_trap() {
+        use eframe::egui::accesskit::Role;
+        let mut h = adv_harness();
+        // The two swatches are ColorWell nodes (no text of their own).
+        let wells: Vec<_> = h.get_all_by_role(Role::ColorWell).collect();
+        assert_eq!(wells.len(), 2);
+        wells[0].click();
+        drop(wells);
+        h.run();
+        // The picker must not offer the Normal/Additive toggle: additive is
+        // unrepresentable in u8 storage (negative alpha collapses to 0, so
+        // every click looked broken). Glow is an explicit checkbox instead.
+        // (Translucency itself works through the alpha slider + 8-digit hex;
+        // covered by unit tests — the slider carries hover-text, not a label.)
+        assert!(h.query_by_label("Additive").is_none());
+        assert!(h.query_by_label("Blending:").is_none());
+    }
+
+    #[test]
+    fn advanced_cursor_sliders_hit_min_and_max() {
+        let mut h = adv_harness();
+        drag_slider_to(&mut h, "ring radius px", 1.0);
+        assert_eq!(h.state().cursor_size, 40.0);
+        drag_slider_to(&mut h, "ring radius px", 0.0);
+        assert_eq!(h.state().cursor_size, 6.0);
+        drag_slider_to(&mut h, "ripple radius px", 1.0);
+        assert_eq!(h.state().ripple_size, 120.0);
+        drag_slider_to(&mut h, "ripple radius px", 0.0);
+        assert_eq!(h.state().ripple_size, 12.0);
+        drag_slider_to(&mut h, "ripple lifetime ms", 1.0);
+        assert_eq!(h.state().ripple_ms, 3000);
+        drag_slider_to(&mut h, "ripple lifetime ms", 0.0);
+        assert_eq!(h.state().ripple_ms, 100);
     }
 
     #[test]

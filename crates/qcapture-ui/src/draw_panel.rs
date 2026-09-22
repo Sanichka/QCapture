@@ -310,7 +310,7 @@ impl DrawPanel {
                             self.color = c;
                         }
                     }
-                    ui.color_edit_button_srgba(&mut self.color);
+                    super::pick_color_no_additive(ui, &mut self.color);
                 });
                 ui.horizontal(|ui| {
                     ui.label("Width");

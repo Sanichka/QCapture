@@ -203,4 +203,126 @@ mod tests {
         assert_eq!(clamp_db(-99.0), -60.0);
         assert_eq!(clamp_db(0.0), 0.0);
     }
+
+    #[test]
+    fn rgba_settings_file_loads() {
+        // Current files carry [r,g,b,a] cursor colors.
+        let dir = std::env::temp_dir();
+        let path = dir.join("qcapture-settings-rgba-test.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "adv": {
+                    "fps": 30,
+                    "bitrate_kbps": 8000,
+                    "canvas": null,
+                    "encoder": "Auto",
+                    "show_cursor": true,
+                    "rc": "Cbr",
+                    "qp": 23,
+                    "crf": 23,
+                    "maxrate_kbps": 12000,
+                    "cursor_color": [255, 0, 0, 128],
+                    "cursor_size": 14.0,
+                    "ripple_color": [255, 255, 255, 255],
+                    "ripple_size": 42.0,
+                    "ripple_ms": 600,
+                    "additive": true
+                }
+            }"#,
+        )
+        .unwrap();
+        let back = load_from(&path).unwrap();
+        let adv = back.adv.unwrap();
+        assert_eq!(adv.cursor_color, [255, 0, 0, 128]);
+        assert!(adv.additive);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rgb_settings_file_loads_opaque() {
+        // Files from the RGB-only release carry [r,g,b] — alpha defaults
+        // to opaque instead of failing the whole load.
+        let dir = std::env::temp_dir();
+        let path = dir.join("qcapture-settings-rgb-test.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "adv": {
+                    "fps": 30,
+                    "bitrate_kbps": 8000,
+                    "canvas": null,
+                    "encoder": "Auto",
+                    "show_cursor": true,
+                    "rc": "Cbr",
+                    "qp": 23,
+                    "crf": 23,
+                    "maxrate_kbps": 12000,
+                    "cursor_color": [255, 210, 0],
+                    "cursor_size": 14.0,
+                    "ripple_color": [255, 255, 255],
+                    "ripple_size": 42.0,
+                    "ripple_ms": 600
+                }
+            }"#,
+        )
+        .unwrap();
+        let back = load_from(&path).unwrap();
+        let adv = back.adv.unwrap();
+        assert_eq!(adv.cursor_color, [255, 210, 0, 255]);
+        assert_eq!(adv.ripple_color, [255, 255, 255, 255]);
+        assert!(!adv.additive);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pre_style_settings_file_loads_with_style_defaults() {
+        // A settings file written before cursor style existed has no
+        // cursor_* keys inside `adv` — it must still load, with defaults.
+        let dir = std::env::temp_dir();
+        let path = dir.join("qcapture-settings-pre-style-test.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "version": 1,
+                "target": null,
+                "region_screen": 0,
+                "window_text": "",
+                "mic_name": null,
+                "audio_on": true,
+                "sys_gain_db": 0.0,
+                "sys_muted": false,
+                "mic_gain_db": 0.0,
+                "mic_muted": false,
+                "adv": {
+                    "fps": 60,
+                    "bitrate_kbps": 8000,
+                    "canvas": null,
+                    "encoder": "Nvenc",
+                    "show_cursor": true,
+                    "rc": "Cbr",
+                    "qp": 23,
+                    "crf": 23,
+                    "maxrate_kbps": 12000
+                },
+                "draw_live": false,
+                "cursor_highlight": false,
+                "cursor_ripple": false,
+                "output_dir": ""
+            }"#,
+        )
+        .unwrap();
+        let back = load_from(&path).unwrap();
+        let adv = back.adv.unwrap();
+        assert_eq!(adv.fps, 60);
+        assert_eq!(adv.encoder, crate::widget::EncoderSel::Nvenc);
+        assert_eq!(adv.cursor_color, [255, 210, 0, 255]);
+        assert_eq!(adv.cursor_size, 14.0);
+        assert_eq!(adv.ripple_color, [255, 255, 255, 255]);
+        assert_eq!(adv.ripple_size, 42.0);
+        assert_eq!(adv.ripple_ms, 600);
+        let _ = std::fs::remove_file(&path);
+    }
 }

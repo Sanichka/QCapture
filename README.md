@@ -43,7 +43,9 @@ and a human smoke test per machine.
   exactly what the encoder sees (no transparent overlay). Works for
   screen, region, and window targets; strokes burn in in real time.
 - **Cursor fx** — opt-in highlight ring + click ripple burned into the video
-  (Windows-only for now).
+  (Windows-only for now), with tunable colors (incl. alpha), radii, ripple
+  lifetime and an additive glow mode (Advanced window, or
+  `--cursor-color/--cursor-size/--ripple-color/--ripple-size/--ripple-ms/--cursor-additive`).
 - **Fixed canvas** — the encoder initializes once; resizes and window-size
   drift are center-cropped/padded mid-record instead of re-initing or freezing.
 - **Pause/resume** — widget ⏸ button or `--pause-at/--resume-at` seconds on

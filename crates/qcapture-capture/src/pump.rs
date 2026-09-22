@@ -125,18 +125,25 @@ pub fn crop_rgba(src: &[u8], sw: u32, x: u32, y: u32, w: u32, h: u32) -> Vec<u8>
     out
 }
 
-/// Cursor fx style (fixed for now; polish pass can expose these).
-const HL_RADIUS: f32 = 14.0;
+/// Ring stroke widths stay fixed (radii/colors/duration are styled).
 const HL_THICK: f32 = 3.0;
-const HL_RGB: (u8, u8, u8) = (255, 210, 0);
-const RIPPLE_MS: u64 = 600;
 const RIPPLE_R0: f32 = 8.0;
-const RIPPLE_R1: f32 = 42.0;
 const RIPPLE_THICK: f32 = 3.0;
-const RIPPLE_RGB: (u8, u8, u8) = (255, 255, 255);
+
+/// Ripple geometry at a given age: expanding radius, fading alpha.
+/// None once the age passes the duration.
+pub fn ripple_frame(ripple_radius: f32, duration_ms: u32, age_ms: u64) -> Option<(f32, u8)> {
+    if duration_ms == 0 || age_ms >= duration_ms as u64 {
+        return None;
+    }
+    let k = age_ms as f32 / duration_ms as f32;
+    let r = (RIPPLE_R0 + (ripple_radius - RIPPLE_R0) * k).max(RIPPLE_R0);
+    Some((r, (255.0 * (1.0 - k)) as u8))
+}
 
 /// Blend one antialiased ring outline onto a top-down tight BGRA frame.
 /// Out-of-frame centers are culled; partial rings clip at the edges.
+/// `additive` adds light instead of blending over (glow).
 #[allow(clippy::too_many_arguments)]
 pub fn blend_ring(
     frame: &mut [u8],
@@ -148,6 +155,7 @@ pub fn blend_ring(
     thick: f32,
     color: (u8, u8, u8),
     alpha: u8,
+    additive: bool,
 ) {
     if alpha == 0 || radius <= 0.0 {
         return;
@@ -171,10 +179,16 @@ pub fn blend_ring(
                 continue;
             }
             let i = ((y as usize) * (w as usize) + (x as usize)) * 4;
-            let inv = 1.0 - a;
-            frame[i] = (color.2 as f32 * a + frame[i] as f32 * inv) as u8;
-            frame[i + 1] = (color.1 as f32 * a + frame[i + 1] as f32 * inv) as u8;
-            frame[i + 2] = (color.0 as f32 * a + frame[i + 2] as f32 * inv) as u8;
+            if additive {
+                frame[i] = (frame[i] as f32 + color.2 as f32 * a).min(255.0) as u8;
+                frame[i + 1] = (frame[i + 1] as f32 + color.1 as f32 * a).min(255.0) as u8;
+                frame[i + 2] = (frame[i + 2] as f32 + color.0 as f32 * a).min(255.0) as u8;
+            } else {
+                let inv = 1.0 - a;
+                frame[i] = (color.2 as f32 * a + frame[i] as f32 * inv) as u8;
+                frame[i + 1] = (color.1 as f32 * a + frame[i + 1] as f32 * inv) as u8;
+                frame[i + 2] = (color.0 as f32 * a + frame[i + 2] as f32 * inv) as u8;
+            }
         }
     }
 }
@@ -270,38 +284,56 @@ pub fn pump(
                     }
                 }
             }
-            ripples.retain(|&(_, _, t)| now.saturating_sub(t) < RIPPLE_MS);
+            let dur = cfg.style.ripple_ms;
+            ripples.retain(|&(_, _, t)| now.saturating_sub(t) < dur as u64);
+            let additive = cfg.style.additive;
             if cfg.highlight {
                 if let Some((x, y)) = f.cursor {
+                    let (r, g, b, a) = (
+                        cfg.style.hl_rgba[0],
+                        cfg.style.hl_rgba[1],
+                        cfg.style.hl_rgba[2],
+                        cfg.style.hl_rgba[3],
+                    );
                     blend_ring(
                         &mut f.bgra,
                         enc.native_w,
                         enc.native_h,
                         x,
                         y,
-                        HL_RADIUS,
+                        cfg.style.hl_radius,
                         HL_THICK,
-                        HL_RGB,
-                        255,
+                        (r, g, b),
+                        a,
+                        additive,
                     );
                 }
             }
             if cfg.ripple {
                 for &(x, y, t) in &ripples {
-                    let k = (now.saturating_sub(t) as f32 / RIPPLE_MS as f32).min(1.0);
-                    let r = RIPPLE_R0 + (RIPPLE_R1 - RIPPLE_R0) * k;
-                    let a = (255.0 * (1.0 - k)) as u8;
-                    blend_ring(
-                        &mut f.bgra,
-                        enc.native_w,
-                        enc.native_h,
-                        x,
-                        y,
-                        r,
-                        RIPPLE_THICK,
-                        RIPPLE_RGB,
-                        a,
-                    );
+                    if let Some((r, fade)) =
+                        ripple_frame(cfg.style.ripple_radius, dur, now.saturating_sub(t))
+                    {
+                        let (rr, gg, bb, base) = (
+                            cfg.style.ripple_rgba[0],
+                            cfg.style.ripple_rgba[1],
+                            cfg.style.ripple_rgba[2],
+                            cfg.style.ripple_rgba[3],
+                        );
+                        let a = (fade as u16 * base as u16 / 255) as u8;
+                        blend_ring(
+                            &mut f.bgra,
+                            enc.native_w,
+                            enc.native_h,
+                            x,
+                            y,
+                            r,
+                            RIPPLE_THICK,
+                            (rr, gg, bb),
+                            a,
+                            additive,
+                        );
+                    }
                 }
             }
         }
@@ -428,7 +460,18 @@ mod tests {
     #[test]
     fn ring_lands_on_circumference_not_center() {
         let mut frame = solid(40, 40, [0, 0, 0, 255]);
-        blend_ring(&mut frame, 40, 40, 20, 20, 8.0, 3.0, (255, 210, 0), 255);
+        blend_ring(
+            &mut frame,
+            40,
+            40,
+            20,
+            20,
+            8.0,
+            3.0,
+            (255, 210, 0),
+            255,
+            false,
+        );
         // Center untouched.
         assert_eq!(
             &frame[(20 * 40 + 20) * 4..(20 * 40 + 20) * 4 + 4],
@@ -466,13 +509,83 @@ mod tests {
     }
 
     #[test]
+    fn ripple_frame_expands_and_fades() {
+        // Birth: small radius, full alpha.
+        let (r0, a0) = ripple_frame(42.0, 600, 0).unwrap();
+        assert!((r0 - 8.0).abs() < 1e-4);
+        assert_eq!(a0, 255);
+        // Mid-life: grown, faded.
+        let (r1, a1) = ripple_frame(42.0, 600, 300).unwrap();
+        assert!(r1 > r0 && r1 < 42.0);
+        assert!(a1 < a0 && a1 > 0);
+        // At/past duration: gone (also guards duration 0).
+        assert_eq!(ripple_frame(42.0, 600, 600), None);
+        assert_eq!(ripple_frame(42.0, 600, 9999), None);
+        assert_eq!(ripple_frame(42.0, 0, 0), None);
+        // Custom radius respected, floor at the inner radius.
+        let (r2, _) = ripple_frame(100.0, 600, 300).unwrap();
+        assert!((r2 - 54.0).abs() < 1.0);
+        let (r3, _) = ripple_frame(4.0, 600, 300).unwrap();
+        assert!((r3 - 8.0).abs() < 1e-4);
+    }
+
+    #[test]
     fn ring_clips_at_edges_without_panic() {
         let mut frame = solid(10, 10, [5, 5, 5, 255]);
-        blend_ring(&mut frame, 10, 10, 0, 0, 8.0, 3.0, HL_RGB, 255);
+        blend_ring(
+            &mut frame,
+            10,
+            10,
+            0,
+            0,
+            8.0,
+            3.0,
+            (255, 210, 0),
+            255,
+            false,
+        );
         assert_eq!(frame.len(), 10 * 10 * 4);
         // Zero alpha is a no-op.
         let before = frame.clone();
-        blend_ring(&mut frame, 10, 10, 5, 5, 4.0, 2.0, HL_RGB, 0);
+        blend_ring(&mut frame, 10, 10, 5, 5, 4.0, 2.0, (255, 210, 0), 0, false);
         assert_eq!(frame, before);
+    }
+
+    #[test]
+    fn ring_additive_brightens_instead_of_replacing() {
+        // Mid-gray frame: normal blend pulls toward red, additive adds red.
+        let mut normal = solid(40, 40, [128, 128, 128, 255]);
+        blend_ring(
+            &mut normal,
+            40,
+            40,
+            20,
+            20,
+            8.0,
+            3.0,
+            (255, 0, 0),
+            255,
+            false,
+        );
+        let mut add = solid(40, 40, [128, 128, 128, 255]);
+        blend_ring(&mut add, 40, 40, 20, 20, 8.0, 3.0, (255, 0, 0), 255, true);
+        let i = (20 * 40 + 28) * 4;
+        // Normal src-over with opaque red: green channel collapses.
+        assert!(
+            normal[i + 1] < 30,
+            "normal blend replaces, got {}",
+            normal[i + 1]
+        );
+        // Additive: red channel saturates, green only gains edge AA (< full).
+        assert_eq!(add[i + 2], 255);
+        assert!(
+            add[i + 1] >= 128,
+            "additive never darkens, got {}",
+            add[i + 1]
+        );
+        // Translucent additive still adds (proportionally).
+        let mut half = solid(40, 40, [100, 100, 100, 255]);
+        blend_ring(&mut half, 40, 40, 20, 20, 8.0, 3.0, (200, 0, 0), 128, true);
+        assert!(half[i + 2] > 100 && half[i + 2] < 255);
     }
 }

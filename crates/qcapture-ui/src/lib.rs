@@ -11,6 +11,22 @@ pub mod widget;
 
 use qcapture_core::{CanvasConfig, CaptureTarget};
 
+/// Color button without egui's Normal/Additive toggle. That toggle encodes
+/// "additive" as negative alpha, which collapses to alpha 0 in u8 storage —
+/// every click looks broken (nothing changes, swatch flashes). Additive glow
+/// is an explicit flag wherever it is supported instead.
+pub(crate) fn pick_color_no_additive(
+    ui: &mut eframe::egui::Ui,
+    c: &mut eframe::egui::Color32,
+) -> bool {
+    eframe::egui::widgets::color_picker::color_edit_button_srgba(
+        ui,
+        c,
+        eframe::egui::widgets::color_picker::Alpha::OnlyBlend,
+    )
+    .changed()
+}
+
 /// What the overlay picker returns. Norm coords keep annotations stable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PickerSelection {

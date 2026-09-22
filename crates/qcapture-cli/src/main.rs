@@ -220,6 +220,31 @@ struct RecordArgs {
     /// Burn an expanding ripple on mouse clicks (same path rules as above).
     #[arg(long, default_value = "false")]
     cursor_ripple: bool,
+
+    /// Highlight ring color: name (red, green, blue, yellow, white, black,
+    /// orange, cyan, magenta) or hex (ff0000, #ff0000). Default: yellow.
+    #[arg(long)]
+    cursor_color: Option<String>,
+
+    /// Highlight ring radius in feed pixels (6..40). Default: 14.
+    #[arg(long)]
+    cursor_size: Option<f32>,
+
+    /// Click ripple color (same format as --cursor-color). Default: white.
+    #[arg(long)]
+    ripple_color: Option<String>,
+
+    /// Click ripple max radius in feed pixels (12..120). Default: 42.
+    #[arg(long)]
+    ripple_size: Option<f32>,
+
+    /// Click ripple lifetime in milliseconds (100..3000). Default: 600.
+    #[arg(long)]
+    ripple_ms: Option<u32>,
+
+    /// Burn cursor fx additively (glow) instead of blending over.
+    #[arg(long, default_value = "false")]
+    cursor_additive: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -692,6 +717,80 @@ fn start_cli_audio(args: &RecordArgs, pause: &Arc<AtomicBool>) -> anyhow::Result
     }
 }
 
+/// Parse a cursor color: 9 basic names (opaque) or hex with optional `#` —
+/// 6 digits (rrggbb, opaque) or 8 digits (rrggbbaa, translucent).
+/// Returns sRGBA quad or a loud error (typos must not silently recolor).
+fn parse_cursor_color(s: &str) -> Result<[u8; 4], String> {
+    let lower = s.trim().to_lowercase();
+    if let Some(rgb) = match lower.as_str() {
+        "red" => Some([255, 0, 0]),
+        "green" => Some([0, 255, 0]),
+        "blue" => Some([0, 120, 255]),
+        "yellow" => Some([255, 210, 0]),
+        "white" => Some([255, 255, 255]),
+        "black" => Some([0, 0, 0]),
+        "orange" => Some([255, 140, 0]),
+        "cyan" => Some([0, 220, 220]),
+        "magenta" => Some([255, 0, 255]),
+        _ => None,
+    } {
+        return Ok([rgb[0], rgb[1], rgb[2], 255]);
+    }
+    let hex = lower.strip_prefix('#').unwrap_or(&lower);
+    if (hex.len() != 6 && hex.len() != 8) || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "bad color '{s}' (want a name, 6-digit hex like ff0000, or 8-digit hex like ff000080)"
+        ));
+    }
+    let v = u32::from_str_radix(hex, 16).map_err(|e| format!("bad color '{s}': {e}"))?;
+    if hex.len() == 6 {
+        Ok([
+            ((v >> 16) & 0xff) as u8,
+            ((v >> 8) & 0xff) as u8,
+            (v & 0xff) as u8,
+            255,
+        ])
+    } else {
+        Ok([
+            ((v >> 24) & 0xff) as u8,
+            ((v >> 16) & 0xff) as u8,
+            ((v >> 8) & 0xff) as u8,
+            (v & 0xff) as u8,
+        ])
+    }
+}
+
+/// Build the cursor style from flags, validating ranges loudly.
+fn cursor_style_from_args(args: &RecordArgs) -> anyhow::Result<qcapture_core::CursorStyle> {
+    let mut style = qcapture_core::CursorStyle::default();
+    if let Some(c) = &args.cursor_color {
+        style.hl_rgba = parse_cursor_color(c).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    if let Some(s) = args.cursor_size {
+        if !(6.0..=40.0).contains(&s) {
+            anyhow::bail!("--cursor-size must be 6..40 feed pixels");
+        }
+        style.hl_radius = s;
+    }
+    if let Some(c) = &args.ripple_color {
+        style.ripple_rgba = parse_cursor_color(c).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    if let Some(s) = args.ripple_size {
+        if !(12.0..=120.0).contains(&s) {
+            anyhow::bail!("--ripple-size must be 12..120 feed pixels");
+        }
+        style.ripple_radius = s;
+    }
+    if let Some(ms) = args.ripple_ms {
+        if !(100..=3000).contains(&ms) {
+            anyhow::bail!("--ripple-ms must be 100..3000");
+        }
+        style.ripple_ms = ms;
+    }
+    style.additive = args.cursor_additive;
+    Ok(style)
+}
+
 /// Timed auto-pause for headless runs and tests: set `pause` at `pause_at`
 /// seconds, clear it at `resume_at`. Paused spans vanish from both A/V
 /// clocks, so `frames ≈ (duration − paused) × fps` is assertable.
@@ -961,7 +1060,11 @@ fn run_draw_record(
     let output_s = output.to_string();
     let annotate_t = annotate.clone();
     let canvas_t = canvas;
-    let cursor_fx = qcapture_core::CursorFx::opt(args.cursor_highlight, args.cursor_ripple);
+    let cursor_fx = qcapture_core::CursorFx::opt_with(
+        args.cursor_highlight,
+        args.cursor_ripple,
+        cursor_style_from_args(args)?,
+    );
     std::thread::Builder::new()
         .name("qcapture-draw-capture".into())
         .spawn(move || {
@@ -1208,7 +1311,11 @@ fn run_ffmpeg_record(
             let _ = stat_tx.send(Default::default());
         }),
     };
-    let cursor_fx = qcapture_core::CursorFx::opt(args.cursor_highlight, args.cursor_ripple);
+    let cursor_fx = qcapture_core::CursorFx::opt_with(
+        args.cursor_highlight,
+        args.cursor_ripple,
+        cursor_style_from_args(args)?,
+    );
     // Window HWND for cursor mapping (Windows; fail fast: bad title must
     // not record). Other OSes map nothing (cursor fx rejected above).
     #[cfg(windows)]
@@ -1617,5 +1724,117 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
             size as f64 / 1_000_000.0
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args_with(style: &[(&str, &str)]) -> RecordArgs {
+        // Minimal record args with cursor style overrides applied.
+        let mut a = RecordArgs {
+            screen: 0,
+            region: None,
+            window_title: None,
+            region_screen: 0,
+            fps: 30,
+            canvas: None,
+            encoder: "auto".into(),
+            bitrate: 8000,
+            rc: "cbr".into(),
+            qp: None,
+            crf: None,
+            maxrate: None,
+            output: None,
+            duration: None,
+            no_cursor: false,
+            no_audio: false,
+            mic: None,
+            system_gain: 0.0,
+            mic_gain: 0.0,
+            system_mute: false,
+            mic_mute: false,
+            annotate: None,
+            draw: false,
+            draw_test: None,
+            pause_at: None,
+            resume_at: None,
+            cursor_highlight: false,
+            cursor_ripple: false,
+            cursor_color: None,
+            cursor_size: None,
+            ripple_color: None,
+            ripple_size: None,
+            ripple_ms: None,
+            cursor_additive: false,
+        };
+        for (k, v) in style {
+            match *k {
+                "cursor_color" => a.cursor_color = Some(v.to_string()),
+                "cursor_size" => a.cursor_size = Some(v.parse().unwrap()),
+                "ripple_color" => a.ripple_color = Some(v.to_string()),
+                "ripple_size" => a.ripple_size = Some(v.parse().unwrap()),
+                "ripple_ms" => a.ripple_ms = Some(v.parse().unwrap()),
+                _ => panic!("unknown style flag {k}"),
+            }
+        }
+        a
+    }
+
+    #[test]
+    fn cursor_colors_parse_names_and_hex() {
+        assert_eq!(parse_cursor_color("red").unwrap(), [255, 0, 0, 255]);
+        assert_eq!(parse_cursor_color("White").unwrap(), [255, 255, 255, 255]);
+        assert_eq!(parse_cursor_color("ff0000").unwrap(), [255, 0, 0, 255]);
+        assert_eq!(parse_cursor_color("#00ff00").unwrap(), [0, 255, 0, 255]);
+        assert_eq!(parse_cursor_color("  BLUE  ").unwrap(), [0, 120, 255, 255]);
+        // 8-digit hex carries alpha.
+        assert_eq!(parse_cursor_color("ff000080").unwrap(), [255, 0, 0, 128]);
+        assert_eq!(parse_cursor_color("#00ff00ff").unwrap(), [0, 255, 0, 255]);
+        assert!(parse_cursor_color("chartreuse").is_err());
+        assert!(parse_cursor_color("fff").is_err());
+        assert!(parse_cursor_color("fffffff").is_err());
+        assert!(parse_cursor_color("gggggg").is_err());
+        assert!(parse_cursor_color("").is_err());
+    }
+
+    #[test]
+    fn cursor_style_defaults_match_legacy() {
+        let style = cursor_style_from_args(&args_with(&[])).unwrap();
+        assert_eq!(style, qcapture_core::CursorStyle::default());
+    }
+
+    #[test]
+    fn cursor_style_accepts_and_rejects_ranges() {
+        let style = cursor_style_from_args(&args_with(&[
+            ("cursor_color", "red"),
+            ("cursor_size", "20"),
+            ("ripple_color", "#00ff00"),
+            ("ripple_size", "60"),
+            ("ripple_ms", "900"),
+        ]))
+        .unwrap();
+        assert_eq!(style.hl_rgba, [255, 0, 0, 255]);
+        assert_eq!(style.hl_radius, 20.0);
+        assert_eq!(style.ripple_rgba, [0, 255, 0, 255]);
+        assert_eq!(style.ripple_radius, 60.0);
+        assert_eq!(style.ripple_ms, 900);
+        assert!(!style.additive);
+
+        for bad in [
+            vec![("cursor_size", "2")],
+            vec![("cursor_size", "99")],
+            vec![("ripple_size", "5")],
+            vec![("ripple_size", "500")],
+            vec![("ripple_ms", "50")],
+            vec![("ripple_ms", "9999")],
+            vec![("cursor_color", "nope")],
+        ] {
+            assert!(
+                cursor_style_from_args(&args_with(&bad)).is_err(),
+                "must reject {bad:?}"
+            );
+        }
     }
 }

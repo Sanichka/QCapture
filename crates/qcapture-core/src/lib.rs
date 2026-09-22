@@ -226,20 +226,55 @@ impl Container {
     }
 }
 
+/// Cursor fx visual style: ring/ripple colors (sRGB + alpha), radii in
+/// feed pixels, ripple lifetime in milliseconds, and an additive glow mode
+/// (adds light instead of blending over — egui's picker "Additive" radio
+/// can't survive u8 storage, so glow is an explicit flag instead).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct CursorStyle {
+    pub hl_rgba: [u8; 4],
+    pub hl_radius: f32,
+    pub ripple_rgba: [u8; 4],
+    pub ripple_radius: f32,
+    pub ripple_ms: u32,
+    pub additive: bool,
+}
+
+impl Default for CursorStyle {
+    fn default() -> Self {
+        Self {
+            hl_rgba: [255, 210, 0, 255],
+            hl_radius: 14.0,
+            ripple_rgba: [255, 255, 255, 255],
+            ripple_radius: 42.0,
+            ripple_ms: 600,
+            additive: false,
+        }
+    }
+}
+
 /// Cursor highlight ring + click ripple burned into the ffmpeg feed.
 /// CPU-pixel effect: needs the ffmpeg byte path (auto-switches MF like
-/// annotations). Style is fixed for now (yellow ring, white ripple);
-/// these bools only toggle behavior. Defaults off to preserve the
-/// current recording look; opt in per recording.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// annotations). Defaults off to preserve the current recording look;
+/// opt in per recording.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct CursorFx {
     pub highlight: bool,
     pub ripple: bool,
+    pub style: CursorStyle,
 }
 
 impl CursorFx {
     pub fn opt(highlight: bool, ripple: bool) -> Option<Self> {
-        (highlight || ripple).then_some(Self { highlight, ripple })
+        Self::opt_with(highlight, ripple, CursorStyle::default())
+    }
+
+    pub fn opt_with(highlight: bool, ripple: bool, style: CursorStyle) -> Option<Self> {
+        (highlight || ripple).then_some(Self {
+            highlight,
+            ripple,
+            style,
+        })
     }
 
     pub fn is_off(&self) -> bool {
@@ -292,6 +327,22 @@ mod tests {
     fn rect_validation() {
         assert!(validate_rect(Rect::new(0, 0, 100, 100)).is_ok());
         assert!(validate_rect(Rect::new(0, 0, 0, 100)).is_err());
+    }
+
+    #[test]
+    fn cursor_style_defaults_match_legacy() {
+        let style = CursorStyle::default();
+        assert_eq!(style.hl_rgba, [255, 210, 0, 255]);
+        assert_eq!(style.ripple_rgba, [255, 255, 255, 255]);
+        assert_eq!(
+            (style.hl_radius, style.ripple_radius, style.ripple_ms),
+            (14.0, 42.0, 600)
+        );
+        assert!(!style.additive);
+        let fx = CursorFx::opt(true, true).unwrap();
+        assert_eq!(fx.style, style);
+        assert!(CursorFx::opt(false, false).is_none());
+        assert!(!fx.is_off());
     }
 
     #[test]

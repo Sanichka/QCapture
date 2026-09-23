@@ -41,7 +41,7 @@ jobs:
             suffix: macos-aarch64
             ext: tar.gz
             exe_suffix: ""
-            ffmpeg_wheel: https://files.pythonhosted.org/packages/40/5c/f3d8a657d362cc93b81aab8eee82c7beba585df8f25ca925f08c2eea8ed5437a2865611d6/imageio_ffmpeg-0.6.0-py3-none-macosx_11_0_arm64.whl
+            ffmpeg_wheel: https://files.pythonhosted.org/packages/40/5c/f3d8a657d362cc93b81aab8feda487317da5b5d31c0e1fdfd5e986e55d17/imageio_ffmpeg-0.6.0-py3-none-macosx_11_0_arm64.whl
     runs-on: ${{ matrix.os }}
     env:
       ARCHIVE: qcapture-${{ github.ref_name }}-${{ matrix.suffix }}.${{ matrix.ext }}

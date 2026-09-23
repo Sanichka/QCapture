@@ -394,6 +394,7 @@ fn query_ffmpeg(json: bool) -> anyhow::Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
+                        "binary": qcapture_encode::ffmpeg_bin(),
                         "version": info.version_line,
                         "h264_nvenc": info.has_nvenc,
                         "h264_amf": info.has_amf,
@@ -404,6 +405,7 @@ fn query_ffmpeg(json: bool) -> anyhow::Result<()> {
                     }))?
                 );
             } else {
+                println!("binary:            {}", qcapture_encode::ffmpeg_bin().to_string_lossy());
                 println!("{}", info.version_line);
                 println!("h264_nvenc:        {}", info.has_nvenc);
                 println!("h264_amf:          {}", info.has_amf);

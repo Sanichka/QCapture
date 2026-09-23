@@ -61,8 +61,10 @@ and a human smoke test per machine.
 
 - Windows 10+, a modern Linux desktop (X11 or Wayland), or macOS.
 - Rust 1.78+ (`cargo build --release -p qcapture-cli`).
-- `ffmpeg` on PATH (`qcapture --probe-ffmpeg` shows what your build provides;
-  bare `--encoder h264`/`hevc` resolve to the best available family member).
+- `ffmpeg` on PATH when building from source (`qcapture --probe-ffmpeg`
+  shows what your build provides; bare `--encoder h264`/`hevc` resolve to
+  the best available family member). Release archives bundle a static
+  ffmpeg, so installs need nothing extra.
 - Release binary stays under ~11 MB.
 
 ## Install
@@ -71,7 +73,10 @@ Prebuilt binaries ride every GitHub release (`v*` tags):
 `qcapture-<version>-windows-x86_64.zip`,
 `qcapture-<version>-linux-x86_64.tar.gz`,
 `qcapture-<version>-macos-aarch64.tar.gz` — unpack and run.
-`ffmpeg` must be on PATH (see below). Platform notes:
+Every archive bundles a static `ffmpeg` beside the binaries, so nothing
+else needs installing. Resolution order is `QCAPTURE_FFMPEG` env override →
+bundled sibling → `ffmpeg` on PATH (`--probe-ffmpeg` prints which binary
+is used). Platform notes:
 
 - **Windows**: SmartScreen may flag the unsigned exe (More info → Run anyway).
 - **Linux**: needs X11/Wayland client libs (present on any desktop install).

@@ -11,7 +11,8 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 #[derive(Debug, thiserror::Error)]
 pub enum EncodeError {
     #[error(
-        "ffmpeg not found in PATH — install ffmpeg 7.x or place ffmpeg.dll beside qcapture.exe"
+        "ffmpeg not found: no ffmpeg on PATH, none bundled beside the qcapture binary, \
+         and QCAPTURE_FFMPEG unset — release archives bundle one, or install ffmpeg 7.x"
     )]
     FfmpegMissing,
     #[error("ffmpeg probe failed: {0}")]
@@ -30,10 +31,30 @@ pub struct FfmpegInfo {
     pub has_libx264: bool,
 }
 
+/// Resolve the ffmpeg binary: explicit `QCAPTURE_FFMPEG` override first,
+/// then a bundled sibling next to the running exe (release archives ship
+/// one so users install nothing), then plain PATH lookup (`"ffmpeg"`).
+pub fn ffmpeg_bin() -> std::ffi::OsString {
+    if let Ok(ov) = std::env::var("QCAPTURE_FFMPEG") {
+        if !ov.trim().is_empty() {
+            return ov.into();
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sib = dir.join(format!("ffmpeg{}", std::env::consts::EXE_SUFFIX));
+            if sib.is_file() {
+                return sib.into_os_string();
+            }
+        }
+    }
+    "ffmpeg".into()
+}
+
 /// Probe system ffmpeg CLI. Parses `-encoders` output for HW flags.
 /// Returns Err(FfmpegMissing) with a helpful message instead of panicking.
 pub fn probe_ffmpeg() -> Result<FfmpegInfo, EncodeError> {
-    let mut ver_cmd = Command::new("ffmpeg");
+    let mut ver_cmd = Command::new(ffmpeg_bin());
     qcapture_core::hide_child_console(&mut ver_cmd);
     let ver = ver_cmd
         .arg("-version")
@@ -48,7 +69,7 @@ pub fn probe_ffmpeg() -> Result<FfmpegInfo, EncodeError> {
         .unwrap_or("")
         .to_string();
 
-    let mut enc_cmd = Command::new("ffmpeg");
+    let mut enc_cmd = Command::new(ffmpeg_bin());
     qcapture_core::hide_child_console(&mut enc_cmd);
     let enc = enc_cmd
         .args(["-hide_banner", "-encoders"])
@@ -516,7 +537,7 @@ impl RawvideoEncoder {
         args.push(output.into());
 
         tracing::info!(?args, "spawning ffmpeg");
-        let mut ffmpeg_cmd = Command::new("ffmpeg");
+        let mut ffmpeg_cmd = Command::new(ffmpeg_bin());
         qcapture_core::hide_child_console(&mut ffmpeg_cmd);
         let mut child = ffmpeg_cmd
             .args(&args)
@@ -598,8 +619,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn encoder_name_mapping() {
+    fn ffmpeg_bin_override_wins() {
+        // Explicit override always wins (bundled sibling and PATH ignored).
+        std::env::set_var("QCAPTURE_FFMPEG", "/tmp/custom-ffmpeg-test");
         assert_eq!(
+            ffmpeg_bin(),
+            std::ffi::OsString::from("/tmp/custom-ffmpeg-test")
+        );
+        std::env::remove_var("QCAPTURE_FFMPEG");
+        // Without override: bundled sibling when present, else PATH lookup.
+        let fallback = ffmpeg_bin().into_string().unwrap();
+        assert!(
+            fallback == "ffmpeg"
+                || fallback.ends_with("ffmpeg")
+                || fallback.ends_with("ffmpeg.exe")
+        );
+    }
+
+    #[test]
+    fn encoder_name_mapping() {        assert_eq!(
             ffmpeg_encoder_name(EncoderKind::LibX264, EncoderKind::LibX264),
             "libx264"
         );

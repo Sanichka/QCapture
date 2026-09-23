@@ -111,7 +111,15 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: qcapture-*
-          generate_release_notes: true
+          path: pkgs
+      # Explicit gh upload (with visible listing): the previous
+      # softprops/action-gh-release step reported success while silently
+      # attaching zero assets, twice in a row.
+      - run: |
+          ls -la pkgs
+          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" --generate-notes
+          fi
+          gh release upload "${GITHUB_REF_NAME}" pkgs/qcapture-* --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}

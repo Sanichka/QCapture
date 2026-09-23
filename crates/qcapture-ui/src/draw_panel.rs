@@ -633,6 +633,7 @@ pub fn run_draw_window(
     let s = (1280.0 / fw).min(720.0 / fh).clamp(0.15, 1.0);
     let viewport = egui::ViewportBuilder::default()
         .with_title("QCapture — draw live (close window to stop recording)")
+        .with_icon(super::app_icon())
         .with_inner_size([fw * s, fh * s])
         .with_active(true);
     let options = eframe::NativeOptions {

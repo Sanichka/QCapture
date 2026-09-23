@@ -370,6 +370,7 @@ pub fn run() -> Result<(), String> {
 
     let viewport = egui::ViewportBuilder::default()
         .with_title("QCapture")
+        .with_icon(super::app_icon())
         .with_inner_size([430.0, 480.0])
         .with_min_inner_size([360.0, 420.0])
         .with_always_on_top()
@@ -594,34 +595,37 @@ impl WidgetApp {
     }
 
     fn poll_annotate(&mut self) {
-        let take = self
-            .annotate
-            .lock()
-            .ok()
-            .and_then(|mut p| {
-                p.pending = false;
-                p.result.take()
-            })
-            .flatten();
-        if let Some(res) = take {
-            self.region_screen = res.screen;
-            self.target = TargetSel::Region {
-                screen: res.screen,
-                rect: res.rect,
-            };
-            self.pending_doc = Some(res.doc);
-            let r = res.rect;
-            self.last_msg = format!(
-                "annotated region {},{},{},{} ({} strokes)",
-                r.x,
-                r.y,
-                r.w,
-                r.h,
-                self.pending_doc
-                    .as_ref()
-                    .map(|d| d.strokes.len())
-                    .unwrap_or(0)
-            );
+        let take = self.annotate.lock().ok().and_then(|mut p| {
+            p.pending = false;
+            p.result.take()
+        });
+        match take {
+            // Subprocess finished with no usable result (cancelled, crashed,
+            // bad output): say so instead of going silently idle.
+            Some(None) => {
+                self.last_msg = "annotate finished without a result — see log file".to_string();
+            }
+            None => {}
+            Some(Some(res)) => {
+                self.region_screen = res.screen;
+                self.target = TargetSel::Region {
+                    screen: res.screen,
+                    rect: res.rect,
+                };
+                self.pending_doc = Some(res.doc);
+                let r = res.rect;
+                self.last_msg = format!(
+                    "annotated region {},{},{},{} ({} strokes)",
+                    r.x,
+                    r.y,
+                    r.w,
+                    r.h,
+                    self.pending_doc
+                        .as_ref()
+                        .map(|d| d.strokes.len())
+                        .unwrap_or(0)
+                );
+            }
         }
     }
 
@@ -858,8 +862,10 @@ impl WidgetApp {
             ctx2.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             // Small delay so the minimize lands before the overlay opens.
             std::thread::sleep(Duration::from_millis(250));
-            let exe = std::env::current_exe().unwrap_or_else(|_| "qcapture".into());
-            let out = std::process::Command::new(exe)
+            let exe = qcapture_core::cli_helper_exe();
+            let mut pick_cmd = std::process::Command::new(exe);
+            qcapture_core::hide_child_console(&mut pick_cmd);
+            let out = pick_cmd
                 .arg("pick-region")
                 .arg("--screen")
                 .arg(screen.to_string())
@@ -906,8 +912,10 @@ impl WidgetApp {
         std::thread::spawn(move || {
             ctx2.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
             std::thread::sleep(Duration::from_millis(250));
-            let exe = std::env::current_exe().unwrap_or_else(|_| "qcapture".into());
-            let out = std::process::Command::new(&exe)
+            let exe = qcapture_core::cli_helper_exe();
+            let mut annotate_cmd = std::process::Command::new(&exe);
+            qcapture_core::hide_child_console(&mut annotate_cmd);
+            let out = annotate_cmd
                 .arg("annotate")
                 .arg("--screen")
                 .arg(screen.to_string())
@@ -915,19 +923,35 @@ impl WidgetApp {
                 .arg(&doc_path)
                 .output();
             ctx2.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            let parsed = out.ok().and_then(|o| {
-                if !o.status.success() {
-                    return None;
-                }
-                let s = String::from_utf8_lossy(&o.stdout);
-                let rect = parse_region_str(s.trim())?;
-                let doc = qcapture_annotate::AnnotateDoc::load(&doc_path).ok()?;
-                Some(AnnotateResult {
-                    screen: screen as u32,
-                    rect,
-                    doc,
+            let parsed = out
+                .map_err(|e| {
+                    eprintln!("annotate subprocess failed to spawn: {e}");
+                    tracing::warn!("annotate subprocess failed to spawn: {e}");
                 })
-            });
+                .ok()
+                .and_then(|o| {
+                    if !o.status.success() {
+                        eprintln!(
+                            "annotate subprocess exited {}: {}",
+                            o.status,
+                            String::from_utf8_lossy(&o.stderr).trim()
+                        );
+                        tracing::warn!(
+                            "annotate subprocess exited {}: {}",
+                            o.status,
+                            String::from_utf8_lossy(&o.stderr).trim()
+                        );
+                        return None;
+                    }
+                    let s = String::from_utf8_lossy(&o.stdout);
+                    let rect = parse_region_str(s.trim())?;
+                    let doc = qcapture_annotate::AnnotateDoc::load(&doc_path).ok()?;
+                    Some(AnnotateResult {
+                        screen: screen as u32,
+                        rect,
+                        doc,
+                    })
+                });
             if let Ok(mut p) = slot.lock() {
                 p.result = Some(parsed);
             }

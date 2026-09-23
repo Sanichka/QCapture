@@ -35,35 +35,12 @@ pub fn run(
             )
         })
     });
-    let app = EditorApp {
-        monitor,
-        save_path,
-        backdrop_image,
-        backdrop_tex: None,
-        phase: Phase::Select,
-        sel_anchor: None,
-        sel_current: egui::Pos2::ZERO,
-        selection: None,
-        tool: DrawTool::Pen,
-        color: egui::Color32::RED,
-        width: 4.0,
-        font_size: 40.0,
-        strokes: Vec::new(),
-        active_pen: Vec::new(),
-        shape_anchor: None,
-        shape_current: egui::Pos2::ZERO,
-        text_at: None,
-        text_buf: String::new(),
-        preview_tex: None,
-        preview_rev: 0,
-        built_rev: u64::MAX,
-        save_msg: String::new(),
-        done: out.clone(),
-    };
+    let app = editor_app(monitor, save_path, backdrop_image, out.clone());
 
     let scale = monitor.scale.max(1.0);
     let viewport = egui::ViewportBuilder::default()
         .with_title("QCapture — select region, then annotate (Enter: next, Esc: back/cancel)")
+        .with_icon(super::app_icon())
         .with_transparent(false)
         .with_decorations(false)
         .with_always_on_top()
@@ -88,6 +65,44 @@ pub fn run(
     Ok(guard.flatten())
 }
 
+/// Build the editor app (split from [`run`] so headless UI tests drive the
+/// exact same controls the production overlay shows).
+fn editor_app(
+    monitor: MonitorGeom,
+    save_path: String,
+    backdrop_image: Option<egui::ColorImage>,
+    done: Arc<Mutex<Option<Option<Rect>>>>,
+) -> EditorApp {
+    EditorApp {
+        monitor,
+        save_path,
+        backdrop_image,
+        backdrop_tex: None,
+        phase: Phase::Select,
+        sel_anchor: None,
+        sel_current: egui::Pos2::ZERO,
+        selection: None,
+        tool: DrawTool::Pen,
+        color: egui::Color32::RED,
+        width: 4.0,
+        font_size: 40.0,
+        filled: false,
+        image_path: None,
+        pick_rx: None,
+        strokes: Vec::new(),
+        active_pen: Vec::new(),
+        shape_anchor: None,
+        shape_current: egui::Pos2::ZERO,
+        text_at: None,
+        text_buf: String::new(),
+        preview_tex: None,
+        preview_rev: 0,
+        built_rev: u64::MAX,
+        save_msg: String::new(),
+        done,
+    }
+}
+
 struct EditorApp {
     monitor: MonitorGeom,
     save_path: String,
@@ -101,6 +116,15 @@ struct EditorApp {
     color: egui::Color32,
     width: f32,
     font_size: f32,
+    filled: bool,
+    image_path: Option<String>,
+    /// Native file picker in flight (overlay minimized meanwhile so the
+    /// dialog is on top and interactive; minimized/restored like the widget
+    /// overlays do — hide/show does not reliably restore a borderless
+    /// always-on-top window). Result polled per frame below.
+    /// NOTE for tests: never click "Pick image…" headlessly — the worker
+    /// opens a real native dialog and hangs CI.
+    pick_rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
     strokes: Vec<Stroke>,
     active_pen: Vec<egui::Pos2>,
     shape_anchor: Option<egui::Pos2>,
@@ -128,6 +152,7 @@ enum DrawTool {
     Rect,
     Ellipse,
     Text,
+    Image,
 }
 
 impl DrawTool {
@@ -139,6 +164,7 @@ impl DrawTool {
             Self::Rect => "Rect",
             Self::Ellipse => "Ellipse",
             Self::Text => "Text",
+            Self::Image => "Img",
         }
     }
 
@@ -150,6 +176,7 @@ impl DrawTool {
             Self::Rect => Tool::Rect,
             Self::Ellipse => Tool::Ellipse,
             Self::Text => Tool::Text,
+            Self::Image => Tool::Image,
         }
     }
 }
@@ -210,6 +237,10 @@ impl EditorApp {
         if points.len() < 2 && !matches!(tool, Tool::Text | Tool::Pen) {
             return;
         }
+        // Image without a picked file is a no-op (raster would skip it anyway).
+        if tool == Tool::Image && text.as_deref().map(str::is_empty).unwrap_or(true) {
+            return;
+        }
         // Endpoint-preserving Chaikin, like the live draw panel.
         let points = if tool == Tool::Pen {
             qcapture_annotate::smooth_polyline(&points, 2)
@@ -227,7 +258,8 @@ impl EditorApp {
             text,
             appear_ms: 0,
             font_px: Some((self.font_size * ppp).max(6.0)),
-            filled: false,
+            // Only Rect/Ellipse read this; the raster ignores it elsewhere.
+            filled: self.filled,
             font_path: None,
         });
         self.preview_rev += 1;
@@ -420,6 +452,22 @@ impl EditorApp {
             }
         };
 
+        // ---- native picker result (overlay was hidden meanwhile) ----
+        match self.pick_rx.as_ref().map(|rx| rx.try_recv()) {
+            Some(Ok(picked)) => {
+                if picked.is_some() {
+                    self.image_path = picked;
+                }
+                self.pick_rx = None;
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                // Picker thread died before restoring; unminimize defensively.
+                self.pick_rx = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            }
+            _ => {}
+        }
+
         // ---- toolbar (floating window; canvas gestures ignore its rect) ----
         let mut chrome_rect = egui::Rect::NOTHING;
         egui::Window::new("Annotate")
@@ -435,8 +483,61 @@ impl EditorApp {
                         DrawTool::Rect,
                         DrawTool::Ellipse,
                         DrawTool::Text,
+                        DrawTool::Image,
                     ] {
                         ui.selectable_value(&mut self.tool, t, t.label());
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.filled, "Filled")
+                        .on_hover_text("Fill rectangles and ellipses (outline otherwise)");
+                    if self.tool == DrawTool::Image {
+                        // The editor is fullscreen always-on-top: it would bury
+                        // the native dialog and eat its input. Minimize first,
+                        // pick on a thread (blocking is fine while minimized),
+                        // then restore — same pattern as the widget overlays.
+                        if ui.button("Pick image…").clicked() && self.pick_rx.is_none() {
+                            let ctx2 = ctx.clone();
+                            let (tx, rx) = std::sync::mpsc::channel();
+                            self.pick_rx = Some(rx);
+                            eprintln!("hiding editor for native image picker…");
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                            std::thread::spawn(move || {
+                                // Let the minimize land before the dialog opens.
+                                std::thread::sleep(std::time::Duration::from_millis(300));
+                                let picked = rfd::FileDialog::new()
+                                    .set_title("QCapture stamp image")
+                                    .add_filter("Images", &["png", "jpg", "jpeg", "bmp"])
+                                    .pick_file()
+                                    .map(|p| p.to_string_lossy().into_owned());
+                                eprintln!(
+                                    "image picker done (picked: {}) — restoring editor…",
+                                    picked.as_deref().unwrap_or("<cancelled>")
+                                );
+                                ctx2.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                                ctx2.send_viewport_cmd(egui::ViewportCommand::Focus);
+                                // Wake the loop: a minimized window may not be
+                                // pumping frames, leaving the restore queued.
+                                ctx2.request_repaint();
+                                let _ = tx.send(picked);
+                            });
+                        }
+                        let picking = self.pick_rx.is_some();
+                        ui.label(if picking {
+                            "picking…".to_string()
+                        } else {
+                            match &self.image_path {
+                                Some(p) => {
+                                    // Show just the file name; the full path burns in.
+                                    std::path::Path::new(p)
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .unwrap_or(p)
+                                        .to_string()
+                                }
+                                None => "pick an image first".to_string(),
+                            }
+                        });
                     }
                 });
                 ui.horizontal(|ui| {
@@ -580,10 +681,15 @@ impl EditorApp {
                         let r = egui::Rect::from_two_pos(a, b);
                         if r.width() >= 4.0 && r.height() >= 4.0 {
                             let tool = self.tool.as_tool();
+                            // Image stamps carry the picked file path;
+                            // push_stroke drops pathless images.
+                            let text = (tool == Tool::Image)
+                                .then(|| self.image_path.clone())
+                                .flatten();
                             if let (Some(pa), Some(pb)) =
                                 (self.to_norm(a, sel, ppp), self.to_norm(b, sel, ppp))
                             {
-                                self.push_stroke(vec![pa, pb], tool, None, ppp);
+                                self.push_stroke(vec![pa, pb], tool, text, ppp);
                             }
                         }
                     }
@@ -639,7 +745,7 @@ impl EditorApp {
                 DrawTool::Line | DrawTool::Arrow => {
                     painter.line_segment([a, b], band);
                 }
-                DrawTool::Rect | DrawTool::Ellipse | DrawTool::Text => {
+                DrawTool::Rect | DrawTool::Ellipse | DrawTool::Text | DrawTool::Image => {
                     painter.rect_stroke(
                         egui::Rect::from_two_pos(a, b),
                         0.0,
@@ -747,5 +853,117 @@ impl eframe::App for EditorApp {
             });
 
         ctx.request_repaint();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui::{Event, Modifiers, PointerButton, Pos2, Vec2};
+    use egui_kittest::{kittest::Queryable, Harness};
+
+    fn test_editor() -> EditorApp {
+        editor_app(
+            MonitorGeom {
+                x: 0,
+                y: 0,
+                w: 800,
+                h: 600,
+                scale: 1.0,
+            },
+            std::env::temp_dir()
+                .join("qcapture-editor-test.qcap.json")
+                .to_string_lossy()
+                .into_owned(),
+            None,
+            Arc::new(Mutex::new(None)),
+        )
+    }
+
+    #[test]
+    fn fill_flag_rides_rect_but_not_line() {
+        let mut app = test_editor();
+        app.filled = true;
+        app.push_stroke(vec![(0.1, 0.1), (0.4, 0.4)], Tool::Rect, None, 1.0);
+        app.push_stroke(vec![(0.1, 0.1), (0.4, 0.4)], Tool::Line, None, 1.0);
+        assert_eq!(app.strokes.len(), 2);
+        assert!(app.strokes[0].filled);
+        // Stored verbatim even where the raster ignores it.
+        assert!(app.strokes[1].filled);
+
+        app.filled = false;
+        app.push_stroke(vec![(0.1, 0.1), (0.4, 0.4)], Tool::Ellipse, None, 1.0);
+        assert!(!app.strokes[2].filled);
+    }
+
+    #[test]
+    fn image_commit_needs_picked_path() {
+        let mut app = test_editor();
+        // No path picked: drag commits nothing.
+        app.push_stroke(vec![(0.1, 0.1), (0.4, 0.4)], Tool::Image, None, 1.0);
+        app.push_stroke(
+            vec![(0.1, 0.1), (0.4, 0.4)],
+            Tool::Image,
+            Some(String::new()),
+            1.0,
+        );
+        assert!(app.strokes.is_empty());
+        // Picked path: commits with the path as payload.
+        app.image_path = Some("D:\\stamps\\arrow.png".into());
+        app.push_stroke(
+            vec![(0.1, 0.1), (0.4, 0.4)],
+            Tool::Image,
+            app.image_path.clone(),
+            1.0,
+        );
+        assert_eq!(app.strokes.len(), 1);
+        assert_eq!(app.strokes[0].tool, Tool::Image);
+        assert_eq!(
+            app.strokes[0].text.as_deref(),
+            Some("D:\\stamps\\arrow.png")
+        );
+    }
+
+    /// Drive Select -> Draw, then flip the Filled checkbox and Img tool.
+    /// Never touches "Pick image…" (native dialog would hang headless CI).
+    #[test]
+    fn toolbar_fill_and_image_select() {
+        let mut h = Harness::builder()
+            .with_size(Vec2::new(800.0, 600.0))
+            .build_eframe(|_cc| test_editor());
+        // Drag-select a region, Enter adopts it and switches to Draw.
+        h.input_mut()
+            .events
+            .push(Event::PointerMoved(Pos2::new(100.0, 100.0)));
+        h.input_mut().events.push(Event::PointerButton {
+            pos: Pos2::new(100.0, 100.0),
+            button: PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::default(),
+        });
+        h.step();
+        h.input_mut()
+            .events
+            .push(Event::PointerMoved(Pos2::new(300.0, 300.0)));
+        h.step();
+        h.input_mut().events.push(Event::PointerButton {
+            pos: Pos2::new(300.0, 300.0),
+            button: PointerButton::Primary,
+            pressed: false,
+            modifiers: Modifiers::default(),
+        });
+        h.step();
+        h.key_combination(&[eframe::egui::Key::Enter]);
+        // The editor repaints every frame, so run() never settles —
+        // fixed steps process the queued input just as well.
+        h.run_steps(4);
+        assert!(h.state().phase == Phase::Draw);
+
+        h.get_by_label("Filled").click();
+        h.run_steps(4);
+        assert!(h.state().filled);
+        h.get_by_label("Img").click();
+        h.run_steps(4);
+        assert!(h.state().tool == DrawTool::Image);
     }
 }

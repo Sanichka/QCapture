@@ -749,6 +749,60 @@ mod tests {
     }
 
     #[test]
+    fn image_stamp_blits_pixels() {
+        // Solid green 4x4 PNG in temp; stamp it over a 20x20 norm region.
+        let path = std::env::temp_dir().join("qcapture-stamp-test.png");
+        let img = image::RgbImage::from_fn(4, 4, |_, _| image::Rgb([0, 255, 0]));
+        img.save(&path).unwrap();
+        let mut doc = AnnotateDoc {
+            canvas_w: 100,
+            canvas_h: 100,
+            ..Default::default()
+        };
+        doc.add_stroke(Stroke {
+            points: vec![(0.2, 0.2), (0.4, 0.4)],
+            color: Rgba(255, 0, 0, 255),
+            width_px: 1.0,
+            tool: Tool::Image,
+            text: Some(path.to_string_lossy().into_owned()),
+            appear_ms: 0,
+            font_px: None,
+            filled: false,
+            font_path: None,
+        })
+        .unwrap();
+        let mut ann = Annotator::new(doc, 100, 100);
+        ann.apply_until(0);
+        // Center of the 20,20+20x20 blit is green, not red.
+        let i = (30 * 100 + 30) * 4;
+        assert_eq!(&ann.overlay_rgba()[i..i + 4], &[0, 255, 0, 255]);
+        // Missing file degrades to nothing instead of panicking.
+        let missing = std::env::temp_dir().join("qcapture-no-such-stamp.png");
+        let _ = std::fs::remove_file(&missing);
+        let mut doc2 = AnnotateDoc {
+            canvas_w: 100,
+            canvas_h: 100,
+            ..Default::default()
+        };
+        doc2.add_stroke(Stroke {
+            points: vec![(0.2, 0.2), (0.4, 0.4)],
+            color: Rgba(255, 0, 0, 255),
+            width_px: 1.0,
+            tool: Tool::Image,
+            text: Some(missing.to_string_lossy().into_owned()),
+            appear_ms: 0,
+            font_px: None,
+            filled: false,
+            font_path: None,
+        })
+        .unwrap();
+        let mut ann2 = Annotator::new(doc2, 100, 100);
+        ann2.apply_until(0);
+        assert_eq!(&ann2.overlay_rgba()[i..i + 4], &[0, 0, 0, 0]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn filled_rect_covers_interior() {
         let mut doc = AnnotateDoc {
             canvas_w: 100,
@@ -796,7 +850,9 @@ mod tests {
         ann.apply_until(0);
         let lit = ann
             .overlay_rgba()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[3] > 20)
             .count();
         if ann.fonts.values().any(|f| f.is_some()) {

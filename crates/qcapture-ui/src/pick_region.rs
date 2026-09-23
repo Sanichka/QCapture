@@ -66,6 +66,7 @@ pub fn run(monitor: MonitorGeom, backdrop: Backdrop) -> Result<Option<Rect>, Str
 
     let viewport = egui::ViewportBuilder::default()
         .with_title("QCapture — drag to select region (Enter: confirm, Esc: cancel)")
+        .with_icon(super::app_icon())
         .with_transparent(true)
         .with_decorations(false)
         .with_always_on_top()

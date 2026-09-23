@@ -159,16 +159,18 @@ mod tests {
 
     #[test]
     fn roundtrip_preserves_everything() {
-        let mut s = PersistedSettings::default();
-        s.target = Some(TargetSel::Region {
-            screen: 1,
-            rect: qcapture_core::Rect::new(10, 20, 640, 480),
-        });
-        s.mic_name = Some("Test Mic".into());
-        s.sys_gain_db = -6.0;
-        s.mic_muted = true;
-        s.draw_live = true;
-        s.output_dir = "D:\\Videos".into();
+        let s = PersistedSettings {
+            target: Some(TargetSel::Region {
+                screen: 1,
+                rect: qcapture_core::Rect::new(10, 20, 640, 480),
+            }),
+            mic_name: Some("Test Mic".into()),
+            sys_gain_db: -6.0,
+            mic_muted: true,
+            draw_live: true,
+            output_dir: "D:\\Videos".into(),
+            ..Default::default()
+        };
         let json = serde_json::to_string(&s).unwrap();
         let back: PersistedSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.output_dir, "D:\\Videos");
@@ -190,9 +192,11 @@ mod tests {
     fn save_and_reload_from_disk() {
         let dir = std::env::temp_dir();
         let path = dir.join("qcapture-settings-roundtrip-test.json");
-        let mut s = PersistedSettings::default();
-        s.window_text = "Notepad".into();
-        s.cursor_ripple = true;
+        let s = PersistedSettings {
+            window_text: "Notepad".into(),
+            cursor_ripple: true,
+            ..Default::default()
+        };
         save_to(&path, &s).unwrap();
         let back = load_from(&path).unwrap();
         assert_eq!(back.window_text, "Notepad");

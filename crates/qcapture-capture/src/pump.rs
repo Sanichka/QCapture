@@ -434,11 +434,8 @@ mod tests {
         let src = solid(2, 2, [0, 0, 255, 255]);
         let out = adapt_frame(2, 2, &src, 4, 4);
         assert_eq!(out.len(), 4 * 4 * 4);
-        // Center pixel is red.
-        assert_eq!(
-            &out[(1 * 4 + 1) * 4..(1 * 4 + 1) * 4 + 4],
-            &[0, 0, 255, 255]
-        );
+        // Center pixel is red: row 1, col 1 of 4-wide frame → bytes 20..24.
+        assert_eq!(&out[20..24], &[0, 0, 255, 255]);
         // Corner is black pad.
         assert_eq!(&out[0..4], &[0, 0, 0, 0]);
     }

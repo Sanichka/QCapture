@@ -9,6 +9,29 @@ pub mod pick_region;
 pub mod settings;
 pub mod widget;
 
+/// Window/taskbar icon shared by every eframe viewport (widget, picker,
+/// editor, draw): white Q ring + red record dot on a dark tile. Baked in
+/// as raw 128x128 RGBA so no image decoder is needed at runtime.
+pub fn app_icon() -> eframe::egui::IconData {
+    const W: usize = 128;
+    const H: usize = 128;
+    let bytes = include_bytes!("../assets/icon-128.rgba");
+    if bytes.len() == W * H * 4 {
+        eframe::egui::IconData {
+            rgba: bytes.to_vec(),
+            width: W as u32,
+            height: H as u32,
+        }
+    } else {
+        // Asset missing/corrupt: 1x1 transparent rather than no icon.
+        eframe::egui::IconData {
+            rgba: vec![0, 0, 0, 0],
+            width: 1,
+            height: 1,
+        }
+    }
+}
+
 use qcapture_core::{CanvasConfig, CaptureTarget};
 
 /// Color button without egui's Normal/Additive toggle. That toggle encodes

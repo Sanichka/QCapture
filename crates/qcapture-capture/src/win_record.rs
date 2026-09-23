@@ -593,16 +593,14 @@ mod tests {
         let mut tight = vec![0u8; 8 * 8 * 4];
         assert!(ann.blend_bgra(&mut tight) > 0);
         // Norm y=0.1 on 8px lands on top-down row 1; x=4 sits on the line.
-        assert_eq!(
-            tight[(1 * 8 + 4) * 4 + 2],
-            255,
-            "red line on top-down row 1"
-        );
+        // Byte index: row 1, col 4 of 8-wide frame, B channel → 50.
+        assert_eq!(tight[50], 255, "red line on top-down row 1");
         assert_eq!(tight[(7 * 8 + 4) * 4 + 2], 0, "bottom row clean");
         // Flip for the DIB push: row 1 must move to bottom-up row 6.
         let mut flipped = Vec::new();
         let out = flip_rows_vertical(&tight, 8, 8, &mut flipped);
         assert_eq!(out[(6 * 8 + 4) * 4 + 2], 255, "red line on bottom-up row 6");
-        assert_eq!(out[(0 * 8 + 4) * 4 + 2], 0, "first row clean after flip");
+        // Byte index: row 0, col 4 of 8-wide frame, B channel → 18.
+        assert_eq!(out[18], 0, "first row clean after flip");
     }
 }

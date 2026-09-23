@@ -33,7 +33,9 @@ pub struct FfmpegInfo {
 /// Probe system ffmpeg CLI. Parses `-encoders` output for HW flags.
 /// Returns Err(FfmpegMissing) with a helpful message instead of panicking.
 pub fn probe_ffmpeg() -> Result<FfmpegInfo, EncodeError> {
-    let ver = Command::new("ffmpeg")
+    let mut ver_cmd = Command::new("ffmpeg");
+    qcapture_core::hide_child_console(&mut ver_cmd);
+    let ver = ver_cmd
         .arg("-version")
         .output()
         .map_err(|_| EncodeError::FfmpegMissing)?;
@@ -46,7 +48,9 @@ pub fn probe_ffmpeg() -> Result<FfmpegInfo, EncodeError> {
         .unwrap_or("")
         .to_string();
 
-    let enc = Command::new("ffmpeg")
+    let mut enc_cmd = Command::new("ffmpeg");
+    qcapture_core::hide_child_console(&mut enc_cmd);
+    let enc = enc_cmd
         .args(["-hide_banner", "-encoders"])
         .output()
         .map_err(|e| EncodeError::Probe(e.to_string()))?;
@@ -512,7 +516,9 @@ impl RawvideoEncoder {
         args.push(output.into());
 
         tracing::info!(?args, "spawning ffmpeg");
-        let mut child = Command::new("ffmpeg")
+        let mut ffmpeg_cmd = Command::new("ffmpeg");
+        qcapture_core::hide_child_console(&mut ffmpeg_cmd);
+        let mut child = ffmpeg_cmd
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())

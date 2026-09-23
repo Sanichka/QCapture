@@ -319,6 +319,41 @@ pub fn validate_rect(r: Rect) -> Result<(), CoreError> {
     Ok(())
 }
 
+/// Hide the console window of a spawned child process on Windows
+/// (`CREATE_NO_WINDOW`). The widget launcher is a GUI-subsystem binary with
+/// no console of its own, so every console-subsystem child (ffmpeg, the CLI
+/// helper) would otherwise pop a visible console window. No-op elsewhere.
+pub fn hide_child_console(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+    }
+}
+
+/// Resolve the CLI helper exe for overlay subprocesses (`pick-region`,
+/// `annotate`). The GUI launcher (`qcapture-widget`) ignores CLI args and
+/// just opens another widget, so when this process IS the launcher, prefer
+/// the sibling `qcapture` binary — falling back to ourselves when it is
+/// missing (dev layouts, single-binary installs).
+pub fn cli_helper_exe() -> std::path::PathBuf {
+    let cur = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("qcapture"));
+    let stem = cur.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    if stem.eq_ignore_ascii_case("qcapture-widget") {
+        let mut sib = cur.clone();
+        sib.set_file_name(format!("qcapture{}", std::env::consts::EXE_SUFFIX));
+        if sib.exists() {
+            return sib;
+        }
+    }
+    cur
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -117,9 +117,10 @@ jobs:
       # attaching zero assets, twice in a row.
       - run: |
           ls -la pkgs
-          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release create "${GITHUB_REF_NAME}" --generate-notes
+          # -R: the publish job has no checkout, so gh gets the repo explicitly.
+          if ! gh release view "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" --generate-notes
           fi
-          gh release upload "${GITHUB_REF_NAME}" pkgs/qcapture-* --clobber
+          gh release upload "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" pkgs/qcapture-* --clobber
         env:
           GH_TOKEN: ${{ github.token }}

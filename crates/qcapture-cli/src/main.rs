@@ -405,7 +405,10 @@ fn query_ffmpeg(json: bool) -> anyhow::Result<()> {
                     }))?
                 );
             } else {
-                println!("binary:            {}", qcapture_encode::ffmpeg_bin().to_string_lossy());
+                println!(
+                    "binary:            {}",
+                    qcapture_encode::ffmpeg_bin().to_string_lossy()
+                );
                 println!("{}", info.version_line);
                 println!("h264_nvenc:        {}", info.has_nvenc);
                 println!("h264_amf:          {}", info.has_amf);

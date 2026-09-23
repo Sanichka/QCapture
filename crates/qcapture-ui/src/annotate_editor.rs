@@ -542,7 +542,7 @@ impl EditorApp {
                 });
                 ui.horizontal(|ui| {
                     for c in PRESET_COLORS {
-                        let mark = if self.color == c { "◉" } else { "●" };
+                        let mark = if self.color == c { "✔" } else { "■" };
                         if ui
                             .button(egui::RichText::new(mark).color(c))
                             .on_hover_text(format!("rgb({},{},{})", c.r(), c.g(), c.b()))
@@ -551,7 +551,7 @@ impl EditorApp {
                             self.color = c;
                         }
                     }
-                    super::pick_color_no_additive(ui, &mut self.color);
+                    super::pick_color_closable(ui, "annotate-custom", &mut self.color);
                 });
                 ui.horizontal(|ui| {
                     ui.label("Width");
@@ -843,12 +843,30 @@ impl eframe::App for EditorApp {
                         "draw inside the region · Ctrl+Z: undo · Record burns it in · Esc: back"
                     }
                 };
+                // HUD hint: big bright text on a dark pill so it stays
+                // readable over any video frame.
+                let font = egui::FontId::proportional(19.0);
+                let galley =
+                    painter.layout_no_wrap(hint.to_owned(), font.clone(), egui::Color32::WHITE);
+                let text_pos = egui::Pos2::new(win.center().x, win.max.y - 40.0);
+                let text_rect = egui::Rect::from_min_max(
+                    egui::Pos2::new(
+                        text_pos.x - galley.size().x / 2.0,
+                        text_pos.y - galley.size().y,
+                    ),
+                    text_pos,
+                );
+                painter.rect_filled(
+                    text_rect.expand(12.0),
+                    9.0,
+                    egui::Color32::from_black_alpha(175),
+                );
                 painter.text(
-                    egui::Pos2::new(win.center().x, win.max.y - 34.0),
+                    text_pos,
                     egui::Align2::CENTER_BOTTOM,
                     hint,
-                    egui::FontId::proportional(14.0),
-                    egui::Color32::from_white_alpha(220),
+                    font,
+                    egui::Color32::WHITE,
                 );
             });
 

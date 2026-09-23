@@ -34,20 +34,48 @@ pub fn app_icon() -> eframe::egui::IconData {
 
 use qcapture_core::{CanvasConfig, CaptureTarget};
 
-/// Color button without egui's Normal/Additive toggle. That toggle encodes
-/// "additive" as negative alpha, which collapses to alpha 0 in u8 storage —
-/// every click looks broken (nothing changes, swatch flashes). Additive glow
-/// is an explicit flag wherever it is supported instead.
-pub(crate) fn pick_color_no_additive(
+/// Color button with an explicit-× picker window. The stock
+/// `color_edit_button` popup has no close affordance (only click-away),
+/// so this owns a small window with the same inline picker plus the
+/// native window ×. `id_salt` distinguishes the ring/ripple/custom sites.
+pub(crate) fn pick_color_closable(
     ui: &mut eframe::egui::Ui,
+    id_salt: &str,
     c: &mut eframe::egui::Color32,
 ) -> bool {
-    eframe::egui::widgets::color_picker::color_edit_button_srgba(
-        ui,
-        c,
-        eframe::egui::widgets::color_picker::Alpha::OnlyBlend,
-    )
-    .changed()
+    use eframe::egui::widgets::color_picker::{color_picker_color32, Alpha};
+    let popup_id = ui.make_persistent_id(id_salt);
+    let mut open = ui.data_mut(|d| d.get_temp::<bool>(popup_id).unwrap_or(false));
+    let mut changed = false;
+    let swatch = eframe::egui::RichText::new("■").color(*c).size(18.0);
+    if ui.button(swatch).on_hover_text("Pick color…").clicked() {
+        open = !open;
+    }
+    if open {
+        let mut close = false;
+        eframe::egui::Window::new(format!("Color — {id_salt}"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ui.ctx(), |ui| {
+                // Roomier selection canvas than the cramped default: the 2D
+                // spectrum + sliders scale with slider_width.
+                ui.spacing_mut().slider_width = 230.0;
+                if color_picker_color32(ui, c, Alpha::OnlyBlend) {
+                    changed = true;
+                }
+                ui.horizontal(|ui| {
+                    if ui.small_button("Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if close {
+            open = false;
+        }
+    }
+    ui.data_mut(|d| d.insert_temp(popup_id, open));
+    changed
 }
 
 /// What the overlay picker returns. Norm coords keep annotations stable.

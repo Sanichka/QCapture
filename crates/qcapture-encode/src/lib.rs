@@ -637,7 +637,8 @@ mod tests {
     }
 
     #[test]
-    fn encoder_name_mapping() {        assert_eq!(
+    fn encoder_name_mapping() {
+        assert_eq!(
             ffmpeg_encoder_name(EncoderKind::LibX264, EncoderKind::LibX264),
             "libx264"
         );

@@ -562,7 +562,7 @@ impl WidgetApp {
                     match merged.save(&sidecar) {
                         Ok(()) => {
                             self.last_msg.push_str(&format!(
-                                " (+{} live strokes → {sidecar})",
+                                " (+{} live strokes in {sidecar})",
                                 merged.strokes.len()
                             ));
                         }
@@ -1480,7 +1480,7 @@ fn show_advanced_panel(ui: &mut egui::Ui, a: &mut AdvCfg) {
             a.cursor_color[2],
             a.cursor_color[3],
         );
-        if super::pick_color_no_additive(ui, &mut c) {
+        if super::pick_color_closable(ui, "ring", &mut c) {
             a.cursor_color = [c.r(), c.g(), c.b(), c.a()];
         }
         ui.label("Ripple color");
@@ -1490,7 +1490,7 @@ fn show_advanced_panel(ui: &mut egui::Ui, a: &mut AdvCfg) {
             a.ripple_color[2],
             a.ripple_color[3],
         );
-        if super::pick_color_no_additive(ui, &mut r) {
+        if super::pick_color_closable(ui, "ripple", &mut r) {
             a.ripple_color = [r.r(), r.g(), r.b(), r.a()];
         }
     });
@@ -1529,7 +1529,9 @@ impl eframe::App for WidgetApp {
                 egui::ViewportId::from_hash_of("qcapture-advanced"),
                 egui::ViewportBuilder::default()
                     .with_title("QCapture — Advanced")
-                    .with_inner_size([300.0, 400.0])
+                    .with_icon(crate::app_icon())
+                    .with_inner_size([480.0, 540.0])
+                    .with_min_inner_size([420.0, 380.0])
                     .with_always_on_top(),
                 move |ctx, _| {
                     if let Ok(mut a) = adv.lock() {
@@ -1554,6 +1556,7 @@ impl eframe::App for WidgetApp {
                 egui::ViewportId::from_hash_of("qcapture-countdown"),
                 egui::ViewportBuilder::default()
                     .with_title("QCapture — starting…")
+                    .with_icon(crate::app_icon())
                     .with_inner_size([280.0, 170.0])
                     .with_resizable(false)
                     .with_always_on_top(),
@@ -1593,6 +1596,7 @@ impl eframe::App for WidgetApp {
                 egui::ViewportId::from_hash_of("qcapture-draw"),
                 egui::ViewportBuilder::default()
                     .with_title("QCapture — draw live (close keeps recording)")
+                    .with_icon(crate::app_icon())
                     .with_inner_size([init_w as f32 * s, init_h as f32 * s]),
                 move |ctx, _| {
                     ctx.request_repaint_after(std::time::Duration::from_millis(100));
@@ -1803,7 +1807,7 @@ impl eframe::App for WidgetApp {
                 ui.horizontal(|ui| {
                     let mut m = self.levels.muted(true);
                     if ui
-                        .selectable_label(m, if m { "🎙🚫" } else { "🎙" })
+                        .selectable_label(m, if m { "Muted" } else { "Mic" })
                         .on_hover_text("Mute mic")
                         .clicked()
                     {
@@ -1891,14 +1895,14 @@ impl eframe::App for WidgetApp {
                 if self.countdown_until.is_some() {
                     // Countdown running: Record becomes Cancel.
                     if ui
-                        .add_sized([390.0, 36.0], egui::Button::new("✕  Cancel countdown"))
+                        .add_sized([390.0, 36.0], egui::Button::new("×  Cancel countdown"))
                         .clicked()
                     {
                         self.countdown_until = None;
                         self.last_msg = "countdown cancelled.".to_string();
                     }
                 } else if ui
-                    .add_sized([390.0, 36.0], egui::Button::new("●  Record"))
+                    .add_sized([390.0, 36.0], egui::Button::new("⏺  Record"))
                     .clicked()
                 {
                     // Validate window target early for a loud error instead of a
@@ -2471,14 +2475,14 @@ mod tests {
         h.get_by_label("⏳ Countdown").click();
         h.run();
         assert!(h.state().countdown_enabled);
-        h.get_by_label("●  Record").click();
+        h.get_by_label("⏺  Record").click();
         // Counting down repaints continuously, so run() never settles —
         // fixed steps process the queued clicks just as well.
         h.run_steps(6);
         assert!(h.state().rec.is_none());
         assert!(h.state().countdown_until.is_some());
         // Record button is replaced by Cancel while counting down.
-        h.get_by_label("✕  Cancel countdown").click();
+        h.get_by_label("×  Cancel countdown").click();
         h.run_steps(6);
         assert!(h.state().countdown_until.is_none());
         assert!(h.state().rec.is_none());
@@ -2505,7 +2509,7 @@ mod tests {
         let mut h = main_harness();
         h.get_by_label("Window").click();
         h.run();
-        h.get_by_label("●  Record").click();
+        h.get_by_label("⏺  Record").click();
         h.run();
         assert!(h.state().rec.is_none());
         assert!(h.state().last_msg.contains("pick a window first"));
@@ -2538,22 +2542,25 @@ mod tests {
     }
 
     #[test]
-    fn color_picker_has_no_additive_trap() {
-        use eframe::egui::accesskit::Role;
+    fn color_picker_window_opens_and_closes() {
         let mut h = adv_harness();
-        // The two swatches are ColorWell nodes (no text of their own).
-        let wells: Vec<_> = h.get_all_by_role(Role::ColorWell).collect();
-        assert_eq!(wells.len(), 2);
-        wells[0].click();
-        drop(wells);
+        // Picker windows stay hidden until their swatch is clicked.
+        assert!(h.query_by_label("Color — ring").is_none());
+        // Two ■ swatches (ring, ripple): first in layout order is ring.
+        let mut swatches = h.get_all_by_label("■");
+        swatches.next().expect("ring swatch").click();
+        drop(swatches);
         h.run();
-        // The picker must not offer the Normal/Additive toggle: additive is
-        // unrepresentable in u8 storage (negative alpha collapses to 0, so
-        // every click looked broken). Glow is an explicit checkbox instead.
-        // (Translucency itself works through the alpha slider + 8-digit hex;
-        // covered by unit tests — the slider carries hover-text, not a label.)
+        // Own window (not the stock popup): no Normal/Additive toggle, since
+        // additive is unrepresentable in u8 storage (negative alpha collapses
+        // to 0, so every click looked broken). Glow is an explicit checkbox.
+        assert!(h.query_by_label("Color — ring").is_some());
         assert!(h.query_by_label("Additive").is_none());
         assert!(h.query_by_label("Blending:").is_none());
+        // The window's × (or its Close button) dismisses it again.
+        h.get_by_label("Close").click();
+        h.run();
+        assert!(h.query_by_label("Color — ring").is_none());
     }
 
     #[test]

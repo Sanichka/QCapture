@@ -305,12 +305,12 @@ impl DrawPanel {
                 });
                 ui.horizontal(|ui| {
                     for c in PRESET_COLORS {
-                        let mark = if self.color == c { "◉" } else { "●" };
+                        let mark = if self.color == c { "✔" } else { "■" };
                         if ui.button(egui::RichText::new(mark).color(c)).clicked() {
                             self.color = c;
                         }
                     }
-                    super::pick_color_no_additive(ui, &mut self.color);
+                    super::pick_color_closable(ui, "draw-custom", &mut self.color);
                 });
                 ui.horizontal(|ui| {
                     ui.label("Width");

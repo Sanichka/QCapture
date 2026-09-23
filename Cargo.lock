@@ -3092,7 +3092,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "qcapture-annotate"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ab_glyph",
  "image 0.25.10",
@@ -3104,7 +3104,7 @@ dependencies = [
 
 [[package]]
 name = "qcapture-audio"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "cpal",
  "flume",
@@ -3117,7 +3117,7 @@ dependencies = [
 
 [[package]]
 name = "qcapture-capture"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "display-info",
  "flume",
@@ -3134,7 +3134,7 @@ dependencies = [
 
 [[package]]
 name = "qcapture-cli"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3155,7 +3155,7 @@ dependencies = [
 
 [[package]]
 name = "qcapture-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -3163,7 +3163,7 @@ dependencies = [
 
 [[package]]
 name = "qcapture-encode"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "flume",
  "interprocess",
@@ -3175,7 +3175,7 @@ dependencies = [
 
 [[package]]
 name = "qcapture-ui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "eframe",

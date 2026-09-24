@@ -10,7 +10,7 @@ use qcapture_annotate::raster::Annotator;
 use qcapture_annotate::{AnnotateDoc, DrawEvent};
 use qcapture_core::{CanvasConfig, CursorFx, EncoderKind, RateControl};
 use qcapture_encode::{ffmpeg_encoder_name, RawvideoEncoder};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -197,6 +197,76 @@ pub fn blend_ring(
 /// cursor fx, write frames, adapt size flips (fixed-canvas rule), finish.
 /// Clock is pump-start; annotation `appear_ms` is relative to recording
 /// start (WGC warmup ≈ 200 ms early — noted).
+/// CFR pacer: keeps the encoder stream on wall clock.
+///
+/// Capture feeds starve (static screen → WGC sends almost nothing) and burst
+/// (catch-up after a stall); writing frames back-to-back makes the stream
+/// run shorter than wall time while audio stays wall-paced, so `-shortest`
+/// cuts the audio tail and sync drifts further the longer you record.
+/// The pacer fills starved slots with verbatim duplicates of the last
+/// written frame and drops burst frames that arrive before their slot, so
+/// `written ≈ fps × wall seconds` regardless of feed behavior.
+///
+/// Pause freezes the timeline like the mixer does (it emits nothing while
+/// paused): paused frames are dropped and the clock re-anchors on resume,
+/// so no catch-up burst is emitted for the paused span.
+#[derive(Debug)]
+struct Pacer {
+    slot_ms: f64,
+    next_ms: Option<f64>,
+    paused: bool,
+}
+
+impl Pacer {
+    fn new(fps: u32) -> Self {
+        Self {
+            slot_ms: 1000.0 / fps.max(1) as f64,
+            next_ms: None,
+            paused: false,
+        }
+    }
+
+    /// Returns `(duplicates to emit first, whether to write the frame)`.
+    /// `now_ms` is wall time on one monotonic clock (see [`pump`]).
+    fn on_frame(&mut self, now_ms: f64, paused: bool) -> (u64, bool) {
+        if paused {
+            self.paused = true;
+            self.next_ms = Some(now_ms + self.slot_ms);
+            return (0, false);
+        }
+        if self.paused {
+            // Resume edge: re-anchor instead of bursting for the paused span.
+            self.paused = false;
+            self.next_ms = None;
+        }
+        match self.next_ms {
+            // Stream anchors at first-frame arrival (audio starts with the
+            // pipeline too; `-shortest` trims any residual lead-in).
+            None => {
+                self.next_ms = Some(now_ms + self.slot_ms);
+                (0, true)
+            }
+            Some(next) => {
+                let mut dups = 0u64;
+                let mut n = next;
+                while n + self.slot_ms <= now_ms {
+                    dups += 1;
+                    n += self.slot_ms;
+                }
+                self.next_ms = Some(n);
+                if now_ms < n {
+                    // Burst frame, arrived before its slot: drop it.
+                    (dups, false)
+                } else {
+                    self.next_ms = Some(n + self.slot_ms);
+                    (dups, true)
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn pump(
     mut enc: RawvideoEncoder,
     rx: flume::Receiver<RawFrame>,
@@ -205,6 +275,7 @@ pub fn pump(
     preview_tx: Option<flume::Sender<PreviewFrame>>,
     preview_every: u64,
     cursor_fx: Option<CursorFx>,
+    pause: Arc<AtomicBool>,
 ) -> Result<FfmpegStats, String> {
     let t0 = Instant::now();
     let mut annotator = doc.map(|d| {
@@ -229,7 +300,25 @@ pub fn pump(
     }
     let (mut written, mut skipped, mut annotated) = (0u64, 0u64, 0u64);
     let mut ripples: Vec<(i32, i32, u64)> = Vec::new();
+    // Wall-clock pacing (see Pacer): the loop below may starve or burst.
+    let mut pacer = Pacer::new(enc.canvas.fps);
+    let mut last_written: Option<Vec<u8>> = None;
     for mut f in rx {
+        let now_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let (dups, write) = pacer.on_frame(now_ms, pause.load(Ordering::Relaxed));
+        // Fill fully-elapsed slots with the last written frame verbatim.
+        for _ in 0..dups {
+            if let Some(prev) = last_written.as_ref() {
+                enc.write_frame(prev)
+                    .map_err(|e| format!("ffmpeg pipe: {e}"))?;
+                written += 1;
+            }
+        }
+        if !write {
+            // Burst frame arrived before its slot (or paused): drop it.
+            skipped += 1;
+            continue;
+        }
         if f.w != enc.native_w || f.h != enc.native_h {
             // Never re-init the encoder mid-record (fixed-canvas rule) and
             // never drop: adapt keeps video + preview + draw alive across
@@ -351,6 +440,8 @@ pub fn pump(
                 });
             }
         }
+        // Retain for wall-clock gap fill (verbatim duplicates, no re-blend).
+        last_written = Some(std::mem::take(&mut f.bgra));
     }
     enc.finish().map_err(|e| format!("ffmpeg: {e}"))?;
     Ok(FfmpegStats {
@@ -398,9 +489,21 @@ pub fn spawn_pump(
     let preview_tx = job.preview_tx.clone();
     let preview_every = (fps.max(1) / 5).max(1) as u64;
     let cursor_fx = job.cursor_fx;
+    let pause = job.pause_flag.clone();
     let handle = std::thread::Builder::new()
         .name("qcapture-ffmpeg-pump".into())
-        .spawn(move || pump(enc, rx, doc, live_rx, preview_tx, preview_every, cursor_fx))
+        .spawn(move || {
+            pump(
+                enc,
+                rx,
+                doc,
+                live_rx,
+                preview_tx,
+                preview_every,
+                cursor_fx,
+                pause,
+            )
+        })
         .map_err(|e| format!("pump spawn: {e}"))?;
     Ok((tx, handle))
 }
@@ -426,6 +529,37 @@ mod tests {
     fn adapt_same_size_is_identity() {
         let src = solid(4, 4, [10, 20, 30, 255]);
         assert_eq!(adapt_frame(4, 4, &src, 4, 4), src);
+    }
+
+    #[test]
+    fn pacer_anchors_writes_steady_and_fills_gaps() {
+        // 10 fps → 100 ms slots.
+        let mut p = Pacer::new(10);
+        // First frame anchors the stream and always writes.
+        assert_eq!(p.on_frame(1000.0, false), (0, true));
+        // Steady feed: every slot writes, no dups, no drops.
+        assert_eq!(p.on_frame(1100.0, false), (0, true));
+        assert_eq!(p.on_frame(1200.0, false), (0, true));
+        // Starved feed (static screen): slots 1300,1400 elapse with no
+        // frames; the frame at 1550 emits 2 dups then writes (3 slots).
+        assert_eq!(p.on_frame(1550.0, false), (2, true));
+        // Burst (catch-up delivery): frame before its slot drops.
+        assert_eq!(p.on_frame(1560.0, false), (0, false));
+        // Slot [1600,1700) fully elapsed by t=1700: one dup, then write.
+        assert_eq!(p.on_frame(1700.0, false), (1, true));
+    }
+
+    #[test]
+    fn pacer_freezes_across_pause_without_burst() {
+        let mut p = Pacer::new(10);
+        assert_eq!(p.on_frame(0.0, false), (0, true));
+        assert_eq!(p.on_frame(100.0, false), (0, true));
+        // Paused race frame: dropped, timeline rebased (no burst later).
+        assert_eq!(p.on_frame(150.0, true), (0, false));
+        assert_eq!(p.on_frame(200.0, true), (0, false));
+        // Resume after a long gap re-anchors: one write, zero dups.
+        assert_eq!(p.on_frame(5150.0, false), (0, true));
+        assert_eq!(p.on_frame(5250.0, false), (0, true));
     }
 
     #[test]

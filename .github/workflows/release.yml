@@ -27,21 +27,18 @@ jobs:
             suffix: windows-x86_64
             ext: zip
             exe_suffix: .exe
-            ffmpeg_wheel: https://files.pythonhosted.org/packages/2c/c6/fa760e12a2483469e2bf5058c5faff664acf66cadb4df2ad6205b016a73d/imageio_ffmpeg-0.6.0-py3-none-win_amd64.whl
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             bins: qcapture qcapture-widget
             suffix: linux-x86_64
             ext: tar.gz
             exe_suffix: ""
-            ffmpeg_wheel: https://files.pythonhosted.org/packages/a0/2d/43c8522a2038e9d0e7dbdf3a61195ecc31ca576fb1527a528c877e87d973/imageio_ffmpeg-0.6.0-py3-none-manylinux2014_x86_64.whl
           - os: macos-latest
             target: aarch64-apple-darwin
             bins: qcapture qcapture-widget
             suffix: macos-aarch64
             ext: tar.gz
             exe_suffix: ""
-            ffmpeg_wheel: https://files.pythonhosted.org/packages/40/5c/f3d8a657d362cc93b81aab8feda487317da5b5d31c0e1fdfd5e986e55d17/imageio_ffmpeg-0.6.0-py3-none-macosx_11_0_arm64.whl
     runs-on: ${{ matrix.os }}
     env:
       ARCHIVE: qcapture-${{ github.ref_name }}-${{ matrix.suffix }}.${{ matrix.ext }}
@@ -72,20 +69,38 @@ jobs:
             cp "target/${{ matrix.target }}/release/$b" pkg/
           done
           cp README.md pkg/
-      - name: Bundle ffmpeg (pinned static build, zero-install)
+      # Zero-install ffmpeg on Windows/Linux: static 9.x builds bundled beside
+      # the binaries (gyan / johnvansickle). macOS ships NO bundled ffmpeg —
+      # no trustworthy Apple-Silicon static 9.x source exists (evermeet is
+      # Intel-only), so mac users `brew install ffmpeg` (resolved via PATH).
+      # The encoder smoke test gates win/linux: the job fails if the bundled
+      # binary lacks our encoders.
+      - name: Bundle ffmpeg (Windows: gyan 9.x essentials)
+        if: runner.os == 'Windows'
         shell: bash
         run: |
-          curl -sSL -o ffmpeg-dl.whl "${{ matrix.ffmpeg_wheel }}"
-          PY="$(command -v python3 || command -v python)"
-          "$PY" -c "import zipfile; z = zipfile.ZipFile('ffmpeg-dl.whl'); ns = [n for n in z.namelist() if '/binaries/ffmpeg-' in n and not n.endswith('/')]; assert len(ns) == 1, ns; z.extract(ns[0], 'ffx'); print(ns[0])"
-          cp "ffx/imageio_ffmpeg/binaries/ffmpeg-"* "pkg/ffmpeg${{ matrix.exe_suffix }}"
+          curl -fsSL -o ffmpeg-dl.zip "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+          7z x ffmpeg-dl.zip -offdl > /dev/null
+          cp ffdl/*/bin/ffmpeg.exe "pkg/ffmpeg${{ matrix.exe_suffix }}"
+          "pkg/ffmpeg${{ matrix.exe_suffix }}" -hide_banner -encoders | grep -E "h264_nvenc|h264_amf|h264_qsv|h264_videotoolbox|libx264" | head -8
+      - name: Bundle ffmpeg (Linux: johnvansickle 9.x static)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          curl -fsSL -o ffmpeg-dl.tar.xz "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+          mkdir -p ffdl && tar -xJf ffmpeg-dl.tar.xz -C ffdl --wildcards '*/ffmpeg'
+          cp ffdl/*/ffmpeg "pkg/ffmpeg${{ matrix.exe_suffix }}"
           chmod +x "pkg/ffmpeg${{ matrix.exe_suffix }}"
           "pkg/ffmpeg${{ matrix.exe_suffix }}" -hide_banner -encoders | grep -E "h264_nvenc|h264_amf|h264_qsv|h264_videotoolbox|libx264" | head -8
+      - name: Third-party notice
+        shell: bash
+        run: |
           cat > pkg/THIRD-PARTY.txt <<'EOF'
           QCapture release bundle — third-party component:
           ffmpeg (https://ffmpeg.org, GPL-licensed static build) is bundled so no
-          install is needed. Shipped via imageio-ffmpeg 0.6.0 wheels
-          (https://github.com/imageio/imageio-ffmpeg, BSD-2-Clause).
+          install is needed: gyan.dev essentials 9.x on Windows,
+          johnvansickle.com static 9.x on Linux. macOS archives ship no ffmpeg —
+          install it with `brew install ffmpeg` (resolved via PATH).
           ffmpeg sources: https://github.com/FFmpeg/FFmpeg
           EOF
       - name: Archive (zip on Windows)

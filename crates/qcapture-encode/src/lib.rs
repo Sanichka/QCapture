@@ -12,7 +12,8 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 pub enum EncodeError {
     #[error(
         "ffmpeg not found: no ffmpeg on PATH, none bundled beside the qcapture binary, \
-         and QCAPTURE_FFMPEG unset — release archives bundle one, or install ffmpeg 7.x"
+         and QCAPTURE_FFMPEG unset — release archives bundle one (ffmpeg 9.x),
+        or install ffmpeg 5.x+"
     )]
     FfmpegMissing,
     #[error("ffmpeg probe failed: {0}")]
@@ -154,6 +155,9 @@ pub fn supports(kind: EncoderKind, info: &FfmpegInfo) -> bool {
 /// - CQP is constant-QP (NVENC `constqp`, AMF `cqp`, QSV global `-q`).
 ///   x264 has no CQP — use CRF instead (loud error, no silent remap).
 /// - CRF exists only on x264; NVENC/QSV/AMF point at their CQP equivalents.
+/// - VideoToolbox (macOS) speaks bitrate only: CBR/VBR map to `-b:v`
+///   (+`-maxrate`/`-bufsize`, generic codec options the encoder honors);
+///   CQP/CRF have no VT equivalent and fail loudly (no silent remap).
 ///
 /// AMF/QSV non-CBR mappings come from ffmpeg docs (no AMD/Intel HW here to
 /// verify); unknown ffmpeg flags fail loudly at spawn, never silently wrong.
@@ -337,6 +341,38 @@ pub fn rate_control_args(
         (_, RateControl::Crf { .. }) => {
             return Err(EncodeError::Probe(
                 "CRF is only supported with --encoder x264".into(),
+            ));
+        }
+        // --------------------------- VideoToolbox ---------------------------
+        // macOS HW encoder: bitrate-based only (`-b:v` etc. are generic codec
+        // options, so they always parse; the encoder honors them). No
+        // constant-QP/CRF concept — those fail loudly instead of being
+        // silently remapped to a different quality scale.
+        ("h264_videotoolbox", RateControl::Cbr { bitrate_kbps }) => {
+            if *bitrate_kbps == 0 {
+                return Err(EncodeError::Probe("--bitrate must be > 0".into()));
+            }
+            push(&mut out, "-b:v");
+            push(&mut out, &kb(*bitrate_kbps));
+        }
+        (
+            "h264_videotoolbox",
+            RateControl::Vbr {
+                target_kbps,
+                max_kbps,
+            },
+        ) => {
+            check_vbr(*target_kbps, *max_kbps)?;
+            push(&mut out, "-b:v");
+            push(&mut out, &kb(*target_kbps));
+            push(&mut out, "-maxrate");
+            push(&mut out, &kb(*max_kbps));
+            push(&mut out, "-bufsize");
+            push(&mut out, &kb(max_kbps.saturating_mul(2)));
+        }
+        ("h264_videotoolbox", RateControl::Cqp { .. }) => {
+            return Err(EncodeError::Probe(
+                "VideoToolbox has no constant-QP mode — use CBR/VBR bitrate instead".into(),
             ));
         }
         (other, _) => {
@@ -723,5 +759,37 @@ mod tests {
         assert!(
             rate_control_args("nope_enc", &RateControl::Cbr { bitrate_kbps: 1000 }, 30).is_err()
         );
+    }
+
+    #[test]
+    fn rc_videotoolbox_bitrate_modes() {
+        // macOS HW path: CBR/VBR map to generic bitrate flags (the user's
+        // brew-9.0.2 case: auto → videotoolbox must not fail rate mapping).
+        let a = rate_control_args(
+            "h264_videotoolbox",
+            &RateControl::Cbr { bitrate_kbps: 8000 },
+            30,
+        )
+        .unwrap();
+        assert!(has("-b:v", &a) && has("8000k", &a));
+        let a = rate_control_args(
+            "h264_videotoolbox",
+            &RateControl::Vbr {
+                target_kbps: 6000,
+                max_kbps: 9000,
+            },
+            30,
+        )
+        .unwrap();
+        assert!(has("6000k", &a) && has("9000k", &a) && has("18000k", &a));
+        assert!(rate_control_args(
+            "h264_videotoolbox",
+            &RateControl::Cbr { bitrate_kbps: 0 },
+            30
+        )
+        .is_err());
+        // No constant-quality concept on VT: loud errors, never remapped.
+        assert!(rate_control_args("h264_videotoolbox", &RateControl::Cqp { qp: 23 }, 30).is_err());
+        assert!(rate_control_args("h264_videotoolbox", &RateControl::Crf { crf: 23 }, 30).is_err());
     }
 }

@@ -1285,11 +1285,22 @@ fn record_thread_ffmpeg(
     }
     let audio_pipe_name = pipe.as_ref().map(|p| p.name.clone());
     let (stat_tx, stat_rx) = std::sync::mpsc::channel();
-    let on_end: Box<dyn FnOnce() + Send> = match audio {
-        Some(p) => Box::new(move || {
-            let _ = stat_tx.send(p.shutdown());
+    // Audio pipe EOF must precede the pump join: ffmpeg only exits once ALL
+    // inputs hit EOF, and the pump join waits for ffmpeg. Finishing the pipe
+    // here (not after run returns) makes finalize deterministic on every
+    // ffmpeg version — 7.x waits for the open audio input where 5.x exited.
+    let on_end: Box<dyn FnOnce() + Send> = match (audio, pipe) {
+        (Some(a), pipe) => Box::new(move || {
+            let stats = a.shutdown();
+            if let Some(p) = pipe {
+                match p.finish() {
+                    Ok(n) => eprintln!("audio pipe: {:.2} MB -> ffmpeg", n as f64 / 1_000_000.0),
+                    Err(e) => eprintln!("warning: audio pipe: {e}"),
+                }
+            }
+            let _ = stat_tx.send(stats);
         }),
-        None => Box::new(move || {
+        (None, _) => Box::new(move || {
             let _ = stat_tx.send(Default::default());
         }),
     };
@@ -1389,11 +1400,7 @@ fn record_thread_ffmpeg(
         }
     }
     .map_err(|e| e.to_string())?;
-    if let Some(p) = pipe {
-        if let Err(e) = p.finish() {
-            eprintln!("warning: audio pipe: {e}");
-        }
-    }
+    // (Audio pipe already finished inside on_end, before the pump join.)
     let el = t0.elapsed();
     let size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
     let audio_note = match stat_rx.try_recv().ok() {

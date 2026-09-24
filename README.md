@@ -67,8 +67,8 @@ and a human smoke test per machine.
 - Rust 1.78+ (`cargo build --release -p qcapture-cli`).
 - `ffmpeg` on PATH when building from source (`qcapture --probe-ffmpeg`
   shows what your build provides; bare `--encoder h264`/`hevc` resolve to
-  the best available family member). Release archives bundle a static
-  ffmpeg, so installs need nothing extra.
+  the best available family member). Windows/Linux release archives bundle a
+  static ffmpeg, so installs need nothing extra (macOS: `brew install ffmpeg`).
 - Release binary stays under ~11 MB.
 
 ## Install
@@ -77,8 +77,10 @@ Prebuilt binaries ride every GitHub release (`v*` tags):
 `qcapture-<version>-windows-x86_64.zip`,
 `qcapture-<version>-linux-x86_64.tar.gz`,
 `qcapture-<version>-macos-aarch64.tar.gz` — unpack and run.
-Every archive bundles a static `ffmpeg` beside the binaries, so nothing
-else needs installing. Resolution order is `QCAPTURE_FFMPEG` env override →
+Windows/Linux archives bundle a static `ffmpeg` beside the binaries, so
+nothing else needs installing; the macOS archive does not (no trustworthy
+Apple-Silicon static build) — install it with `brew install ffmpeg`.
+Resolution order is `QCAPTURE_FFMPEG` env override →
 bundled sibling → `ffmpeg` on PATH (`--probe-ffmpeg` prints which binary
 is used). Platform notes:
 

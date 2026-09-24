@@ -75,7 +75,7 @@ jobs:
       # Intel-only), so mac users `brew install ffmpeg` (resolved via PATH).
       # The encoder smoke test gates win/linux: the job fails if the bundled
       # binary lacks our encoders.
-      - name: Bundle ffmpeg (Windows: gyan 9.x essentials)
+      - name: "Bundle ffmpeg (Windows: gyan 9.x essentials)"
         if: runner.os == 'Windows'
         shell: bash
         run: |
@@ -83,7 +83,7 @@ jobs:
           7z x ffmpeg-dl.zip -offdl > /dev/null
           cp ffdl/*/bin/ffmpeg.exe "pkg/ffmpeg${{ matrix.exe_suffix }}"
           "pkg/ffmpeg${{ matrix.exe_suffix }}" -hide_banner -encoders | grep -E "h264_nvenc|h264_amf|h264_qsv|h264_videotoolbox|libx264" | head -8
-      - name: Bundle ffmpeg (Linux: johnvansickle 9.x static)
+      - name: "Bundle ffmpeg (Linux: johnvansickle 9.x static)"
         if: runner.os == 'Linux'
         shell: bash
         run: |

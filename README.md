@@ -164,4 +164,5 @@ cargo fmt --all -- --check
 
 ## License
 
-MIT OR Apache-2.0.
+Apache-2.0 (see LICENSE-APACHE). The optional bundled ffmpeg binary is
+GPL-licensed third-party software (see THIRD-PARTY.txt in release archives).

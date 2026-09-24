@@ -1,6 +1,6 @@
 # QCapture
 
-<video src="assets/qcapture.mp4" controls width="100%"></video>
+https://github.com/user-attachments/assets/02a5a05f-39fd-491e-bfd3-005663c13ccc
 
 **QCapture** is a lightweight, cross-platform screen recorder written in Rust —
 OBS-grade power (hardware encoding, mixed audio, annotations, cursor effects)

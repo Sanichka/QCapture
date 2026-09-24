@@ -1,8 +1,12 @@
 # QCapture
 
-QCapture is a lightweight, cross-platform screen recorder written in Rust.
-Goal: OBS-grade power (hardware encoding, mixed audio, annotations) with the
-speed and simplicity of tools like VokoScreenNG — on Windows, Linux, and macOS.
+<video src="assets/qcapture.mp4" controls width="100%"></video>
+
+**QCapture** is a lightweight, cross-platform screen recorder written in Rust —
+OBS-grade power (hardware encoding, mixed audio, annotations, cursor effects)
+with the speed and simplicity of tools like VokoScreenNG. Pick a screen, window,
+or region in the floating widget, hit ⏺ Record, and get an MP4 — on Windows,
+Linux, and macOS. Release archives bundle ffmpeg, so there is nothing to install.
 
 ## Platform support
 
